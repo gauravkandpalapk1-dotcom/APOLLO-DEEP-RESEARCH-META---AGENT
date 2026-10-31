@@ -8,10 +8,16 @@ from apollo.config import Limits
 from apollo.llm import Budget
 from apollo.pipeline import Apollo
 from apollo.state import Chunk
-from apollo.writer import UNVERIFIED, VERIFY_BATCH, VERIFY_RETRY_BATCH, verify
+from apollo.writer import UNVERIFIED, VERIFY_BATCH, VERIFY_RETRY_BATCH, removed_of, verify
 from tests.test_offline import FakeLLM, fake_search
 
 ALLOWED = {"C1": Chunk("C1", "q1", "https://a.example/1", "t", "Farm fact text.", "web", None, None, 1.0, 1)}
+
+
+def _verify(text, allowed, llm):
+    """(clean text, kept count, removed (sentence, reason) pairs, problems) from verify()'s records."""
+    clean, records, problems = verify(text, allowed, llm)
+    return clean, sum(v.verdict == "kept" for v in records), removed_of(records), problems
 
 
 class SkippingVerifier:
@@ -42,7 +48,7 @@ def _text(n_plain=6):
 
 def test_skipped_items_are_retried_then_removed():
     llm = SkippingVerifier()
-    text, kept, removed, problems = verify(_text(), ALLOWED, llm)
+    text, kept, removed, problems = _verify(_text(), ALLOWED, llm)
     assert llm.batches[:2] == [VERIFY_BATCH, 2], llm.batches          # 8 sentences -> 6 + 2
     assert all(b <= VERIFY_RETRY_BATCH for b in llm.batches[2:]) and len(llm.batches) == 3, llm.batches
     assert "FLAKY" in text and "SKIP" not in text and kept == 7
@@ -52,7 +58,7 @@ def test_skipped_items_are_retried_then_removed():
 
 def test_failed_call_is_logged_and_retried():
     llm = SkippingVerifier(fail_first=True)
-    text, kept, removed, problems = verify(_text(), ALLOWED, llm)
+    text, kept, removed, problems = _verify(_text(), ALLOWED, llm)
     assert any("RuntimeError: verifier timed out" in p for p in problems), problems
     assert "Plain fact number 0" in text, "the failed batch's sentences get their retry and are kept"
     assert [s for s, why in removed] == ["A SKIP fact [C1]."]
@@ -63,7 +69,7 @@ def test_nothing_unverified_is_ever_kept():
         def json(self, system, user, **kw):
             super().json(system, user, **kw)
             return {"results": "not a list"}
-    text, kept, removed, problems = verify(_text(), ALLOWED, NeverAnswers())
+    text, kept, removed, problems = _verify(_text(), ALLOWED, NeverAnswers())
     assert kept == 0 and text == "" and len(removed) == 8 and all(why == UNVERIFIED for _, why in removed)
 
 

@@ -3,7 +3,7 @@
     PLAN -> [SEARCH -> REVIEW -> ROUTE]* -> WRITE -> VERIFY -> ASSEMBLE
 
 Every step yields Events so the UI can show progress live."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .agents import apollo_plan, athena, close_open, follow_up_jobs, hermes, route, status_summary
 from .config import Limits
@@ -20,6 +20,9 @@ class Report:
     stats: dict
     removed: list[dict]
     state: RunState
+    # every verified sentence: {section, text_with_refs, verdict, reason, evidence: [{ref_number, url, title,
+    # domain, published, passage}]}, for the evidence inspector
+    sentences: list[dict] = field(default_factory=list)
 
 
 class Apollo:
@@ -73,6 +76,7 @@ class Apollo:
                 break
 
         yield state.event("write", f"Writing {len(plan.sections)} sections from their own evidence")
+        sentences = []
         try:
             results = write_all(state, self.llm)
             for r in results:
@@ -81,7 +85,7 @@ class Apollo:
                 yield state.event("verify", f"'{r.section.title}': {r.kept} sentences kept, "
                                             f"{len(r.removed)} removed by verification",
                                   {"removed": r.removed})
-            md, refs, stats, removed, problems = assemble(state, self.llm, results)
+            md, refs, stats, removed, problems, sentences = assemble(state, self.llm, results)
             for p in problems:
                 yield state.event("system", f"Verifier, introduction/conclusion: {p}")
         except BudgetExceeded as e:
@@ -100,7 +104,7 @@ class Apollo:
                       "failed_searches": len(state.failed_searches), "seconds": round(state.elapsed, 1)})
         if hasattr(self.llm, "status"):
             stats["models"] = self.llm.status()
-        report = Report(md, refs, source_table(state, refs), stats, removed, state)
+        report = Report(md, refs, source_table(state, refs), stats, removed, state, sentences)
         yield state.event("done", "Report ready", {"report": report})
 
 

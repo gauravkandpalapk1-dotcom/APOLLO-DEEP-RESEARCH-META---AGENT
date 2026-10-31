@@ -15,12 +15,22 @@ LIMITATION_SUBJ = re.compile(r"\b(sources?|evidence|data)\b", re.I)
 
 
 @dataclass
+class VerifiedSentence:
+    section: str
+    text: str                 # with internal [C3] citations
+    chunk_ids: list[str]
+    verdict: str              # kept | removed
+    reason: str
+
+
+@dataclass
 class SectionResult:
     section: Section
     text: str
     kept: int = 0
     removed: list = field(default_factory=list)   # (sentence, reason)
     problems: list = field(default_factory=list)  # why the verifier returned too few verdicts, for system events
+    sentences: list = field(default_factory=list)  # VerifiedSentence records in report order
 
 
 # ---------------- stage 1: section writers ----------------
@@ -89,11 +99,13 @@ VERIFY_SYSTEM = ("You check whether source text supports a sentence. Be strict: 
                  + CHUNK_DATA_RULE)
 
 
-def verify(text: str, allowed: dict[str, Chunk], llm: LLM) -> tuple[str, int, list, list]:
-    """Returns (clean_text, kept, removed, problems). Every kept factual sentence cites a real chunk and the
-    verifier confirmed the chunk supports it; sentences the verifier never judged are removed."""
+def verify(text: str, allowed: dict[str, Chunk], llm: LLM,
+           section: str = "") -> tuple[str, list[VerifiedSentence], list[str]]:
+    """Returns (clean_text, records, problems): one VerifiedSentence per drafted sentence, kept or removed with a
+    reason. Every kept factual sentence cites a real chunk and the verifier confirmed the chunk supports it;
+    sentences the verifier never judged are removed."""
     paragraphs = [p for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
-    plan, removed = [], []                       # plan: list of paragraphs, each a list of [sentence, status]
+    plan = []                                    # paragraphs, each a list of [sentence, status, chunk_ids, reason]
     to_check = []
     for p in paragraphs:
         row = []
@@ -105,40 +117,38 @@ def verify(text: str, allowed: dict[str, Chunk], llm: LLM) -> tuple[str, int, li
             s = re.sub(r"\[\s*,?\s*\]", "", s).replace(" .", ".").strip()
             good = [i for i in ids if i in allowed]
             if not good:
-                if is_limitation(s):
-                    row.append([s, "keep"])
-                else:
-                    removed.append((s, "no valid citation"))
+                row.append([s, "keep", [], NO_CLAIM] if is_limitation(s) else [s, "drop", [], "no valid citation"])
                 continue
-            entry = [s, "check", good]
+            entry = [s, "check", good, ""]
             row.append(entry)
             to_check.append(entry)
         plan.append(row)
 
     problems = []
-    missing = _check(to_check, VERIFY_BATCH, allowed, llm, removed, problems)
-    missing = _check(missing, VERIFY_RETRY_BATCH, allowed, llm, removed, problems)   # one retry, smaller batches
+    missing = _check(to_check, VERIFY_BATCH, allowed, llm, problems)
+    missing = _check(missing, VERIFY_RETRY_BATCH, allowed, llm, problems)   # one retry, smaller batches
     for entry in missing:                         # never keep a factual sentence nobody verified
-        entry[1] = "drop"
-        removed.append((entry[0], UNVERIFIED))
+        entry[1], entry[3] = "drop", UNVERIFIED
 
     out_paras = [" ".join(e[0] for e in row if e[1] == "keep") for row in plan]
-    kept = sum(1 for row in plan for e in row if e[1] == "keep")
-    return "\n\n".join(p for p in out_paras if p), kept, removed, problems
+    records = [VerifiedSentence(section, s, ids, "kept" if status == "keep" else "removed", reason)
+               for row in plan for s, status, ids, reason in row]
+    return "\n\n".join(p for p in out_paras if p), records, problems
 
 
 VERIFY_BATCH, VERIFY_RETRY_BATCH = 6, 3
 UNVERIFIED = "could not be verified"
+NO_CLAIM = "says the sources did not cover something; makes no factual claim, so no citation is needed"
 
 
-def _check(entries: list, size: int, allowed: dict[str, Chunk], llm: LLM, removed: list, problems: list) -> list:
-    """Ask the verifier about entries in batches; mark each keep or drop. Returns the entries that got no verdict,
-    and records why in problems (the exception, or an excerpt of a reply with too few verdicts)."""
+def _check(entries: list, size: int, allowed: dict[str, Chunk], llm: LLM, problems: list) -> list:
+    """Ask the verifier about entries in batches; mark each keep or drop with a reason. Returns the entries that
+    got no verdict, and records why in problems (the exception, or an excerpt of a reply with too few verdicts)."""
     missing = []
     for start in range(0, len(entries), size):
         batch = entries[start:start + size]
         items = []
-        for i, (s, _, ids) in enumerate(batch):
+        for i, (s, _, ids, _) in enumerate(batch):
             src = "\n".join(f'<chunk id="{cid}">{allowed[cid].text[:1500]}</chunk>' for cid in ids)
             items.append(f"### Item {i}\nSentence: {CITE.sub('', s).strip()}\nSources:\n{src}")
         res, verdict = None, {}
@@ -160,17 +170,21 @@ def _check(entries: list, size: int, allowed: dict[str, Chunk], llm: LLM, remove
             if r is None:
                 missing.append(entry)
             elif r.get("supported") is False:
-                entry[1] = "drop"
-                removed.append((entry[0], r.get("reason", "not supported by cited source")))
+                entry[1], entry[3] = "drop", str(r.get("reason") or "not supported by cited source")
             else:
-                entry[1] = "keep"
+                entry[1], entry[3] = "keep", str(r.get("reason") or "supported by the cited source")
     return missing
+
+
+def removed_of(records: list[VerifiedSentence]) -> list[tuple[str, str]]:
+    return [(v.text, v.reason) for v in records if v.verdict == "removed"]
 
 
 def write_and_verify(state: RunState, llm: LLM, section: Section) -> SectionResult:
     draft, chunks = write_section(state, llm, section)
-    text, kept, removed, problems = verify(draft, {c.id: c for c in chunks}, llm)
-    return SectionResult(section, text, kept, removed, problems)
+    text, records, problems = verify(draft, {c.id: c for c in chunks}, llm, section.title)
+    return SectionResult(section, text, sum(v.verdict == "kept" for v in records), removed_of(records), problems,
+                         records)
 
 
 def write_all(state: RunState, llm: LLM) -> list[SectionResult]:
@@ -185,7 +199,8 @@ def _jaccard(a: str, b: str) -> float:
 
 
 def dedupe(results: list[SectionResult]) -> int:
-    """Remove sentences that repeat an earlier section's sentence almost word for word."""
+    """Remove sentences that repeat an earlier section's sentence almost word for word; their records are
+    marked removed with reason "duplicate"."""
     seen, dropped = [], 0
     for r in results:
         paras = []
@@ -194,6 +209,11 @@ def dedupe(results: list[SectionResult]) -> int:
             for s in split_sentences(p):
                 if any(_jaccard(s, t) >= 0.75 for t in seen):
                     dropped += 1
+                    rec = next((v for v in r.sentences if v.verdict == "kept" and v.text.strip() == s.strip()), None)
+                    if rec:
+                        rec.verdict, rec.reason = "removed", "duplicate"
+                    else:
+                        r.sentences.append(VerifiedSentence(r.section.title, s, cited_ids(s), "removed", "duplicate"))
                     continue
                 keep.append(s)
                 seen.append(s)
@@ -262,17 +282,54 @@ def render_citations(markdown: str, chunks: dict[str, Chunk]) -> tuple[str, list
     return CITE.sub(repl, markdown), refs
 
 
+def sentence_evidence(records: list[VerifiedSentence], chunks: dict[str, Chunk], refs: list[dict]) -> list[dict]:
+    """Each sentence with its citations turned into the report's reference numbers, and the exact passages it cites.
+    A cited chunk whose source is not in the references (only possible for removed sentences) has ref_number None."""
+    number = {r["url"]: r["n"] for r in refs}
+
+    def repl(m):
+        cs = [chunks.get(cid.strip()) for cid in dict.fromkeys(m.group(1).split(","))]
+        return "".join(f"[[{number[c.url]}]]({c.url})" for c in cs if c and c.url in number)
+
+    out = []
+    for v in records:
+        evidence = [{"ref_number": number.get(c.url), "url": c.url, "title": c.title, "domain": c.domain,
+                     "published": c.published or (str(c.year) if c.year else ""), "passage": c.text}
+                    for c in (chunks.get(cid) for cid in dict.fromkeys(v.chunk_ids)) if c]
+        text = re.sub(r"\s+([.!?])", r"\1", CITE.sub(repl, v.text)).strip()
+        out.append({"section": v.section, "text_with_refs": text, "verdict": v.verdict, "reason": v.reason,
+                    "evidence": evidence})
+    return out
+
+
+REF_LINK = re.compile(r"\[\[\d+\]\]\([^)]*\)")
+MD_SPECIAL = re.compile(r"([\\`*_{}\[\]<>#|~$])")
+
+
+def plain_sentence(text_with_refs: str) -> str:
+    """The sentence without its [[n]](url) reference links, e.g. for an expander label."""
+    return re.sub(r"\s+([.!?,;])", r"\1", REF_LINK.sub("", text_with_refs)).strip()
+
+
+def highlight(passage: str, sentence: str) -> str:
+    """Markdown passage with the words it shares with the sentence in bold (stopwords and short words ignored).
+    The passage is web text, so markdown characters in it are escaped first."""
+    shared = tokens(plain_sentence(sentence)) & tokens(passage)
+    return re.sub(r"[A-Za-z0-9]+", lambda m: f"**{m.group()}**" if m.group().lower() in shared else m.group(),
+                  MD_SPECIAL.sub(r"\\\1", passage))
+
+
 def assemble(state: RunState, llm: LLM, results: list[SectionResult]):
     dropped = dedupe(results)
     used_ids = {i for r in results for i in cited_ids(r.text)}
     allowed = {i: state.chunks[i] for i in used_ids if i in state.chunks}
     intro, concl = "", ""
-    intro_removed, problems = [], []
+    intro_removed, problems, intro_records, concl_records = [], [], [], []
     try:
         intro_raw, concl_raw = intro_and_conclusion(state, llm, results)
-        intro, _, rm1, p1 = verify(intro_raw, allowed, llm)
-        concl, _, rm2, p2 = verify(concl_raw, allowed, llm)
-        intro_removed, problems = rm1 + rm2, p1 + p2
+        intro, intro_records, p1 = verify(intro_raw, allowed, llm, "Introduction")
+        concl, concl_records, p2 = verify(concl_raw, allowed, llm, "Conclusion")
+        intro_removed, problems = removed_of(intro_records) + removed_of(concl_records), p1 + p2
     except Exception as e:
         intro = f"*Introduction could not be generated ({str(e)[:80]}).*"
     if not intro:  # LLM intro was empty or fully removed in verification: list the sections (no facts, no citations)
@@ -288,8 +345,10 @@ def assemble(state: RunState, llm: LLM, results: list[SectionResult]):
     md += "\n\n## References\n\n" + "\n".join(
         f"{r['n']}. [{r['title']}]({r['url']}) — {r['type']}{', ' + r['published'] if r['published'] else ''}"
         for r in refs)
+    records = intro_records + [v for r in results for v in r.sentences] + concl_records
+    sentences = sentence_evidence(records, state.chunks, refs)
     stats = {
-        "sentences_kept": sum(r.kept for r in results),
+        "sentences_kept": sum(v.verdict == "kept" for r in results for v in r.sentences),   # after duplicates
         "sentences_removed": sum(len(r.removed) for r in results) + len(intro_removed),
         "sentences_unverified_removed": unverified,
         "duplicates_removed": dropped,
@@ -298,4 +357,4 @@ def assemble(state: RunState, llm: LLM, results: list[SectionResult]):
     }
     removed_log = [{"section": r.section.title, "sentence": s, "reason": why} for r in results for s, why in r.removed]
     removed_log += [{"section": "Intro/Conclusion", "sentence": s, "reason": why} for s, why in intro_removed]
-    return md, refs, stats, removed_log, problems
+    return md, refs, stats, removed_log, problems, sentences

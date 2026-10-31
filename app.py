@@ -5,6 +5,7 @@ import streamlit as st
 from apollo.agents import PlanError, plan_from_rows, plan_rows
 from apollo.config import SOURCE_TYPES, Limits
 from apollo.pipeline import Apollo
+from apollo.writer import highlight, plain_sentence
 
 st.set_page_config(page_title="Apollo research", page_icon="🔭", layout="wide")
 
@@ -116,7 +117,8 @@ if rep:
         st.caption("Models used: " + ", ".join(f"{role} = {label}" for role, label in m["active"].items())
                    + f" · model or key switches: {m['switches']}")
 
-    t_report, t_sources, t_trace, t_removed = st.tabs(["Report", "Sources", "Trace", "Removed sentences"])
+    t_report, t_evidence, t_sources, t_trace, t_removed = st.tabs(
+        ["Report", "Evidence", "Sources", "Trace", "Removed sentences"])
     with t_report:
         st.markdown(rep.markdown)
         d1, d2 = st.columns(2)
@@ -127,8 +129,38 @@ if rep:
                                mime="application/pdf")
         except Exception as e:
             d2.caption(f"PDF export unavailable: {e}")
+    with t_evidence:
+        st.caption("Open any sentence to see the exact passages it cites. Words the sentence shares with a "
+                   "passage are in bold.")
+        sentences = rep.sentences
+        sections = list(dict.fromkeys(x["section"] for x in sentences))
+        f1, f2 = st.columns([3, 1])
+        pick = f1.selectbox("Section", ["All sections"] + sections, key="ev_section")
+        show_removed = f2.toggle("Show removed sentences", key="ev_removed")
+        shown = [x for x in sentences if pick in ("All sections", x["section"])]
+        for x in (x for x in shown if x["verdict"] == "kept"):
+            plain = plain_sentence(x["text_with_refs"])
+            with st.expander(f"{x['section']}: {plain[:160]}{'…' if len(plain) > 160 else ''}"):
+                st.markdown(x["text_with_refs"])
+                if not x["evidence"]:
+                    st.caption(f"No cited passage: this sentence {x['reason']}.")
+                for ev in x["evidence"]:
+                    ref = f"[{ev['ref_number']}] " if ev["ref_number"] else ""
+                    st.markdown(f"**{ref}[{ev['title'] or ev['url']}]({ev['url']})** · {ev['domain']} · "
+                                f"{ev['published'] or 'date unknown'}")
+                    st.markdown("> " + highlight(ev["passage"], x["text_with_refs"]))
+        if show_removed:
+            st.subheader("Removed sentences")
+            removed_rows = [x for x in shown if x["verdict"] == "removed"]
+            for x in removed_rows:
+                st.markdown(f"- **{x['section']}**: {plain_sentence(x['text_with_refs'])}  \n  *Removed: {x['reason']}*")
+            if not removed_rows:
+                st.write("No sentences were removed in this section.")
     with t_sources:
-        st.dataframe(pd.DataFrame(rep.sources), width="stretch", hide_index=True,
+        src = pd.DataFrame(rep.sources)
+        if "ref" in src:   # numbers for cited sources, "" for the rest: one text column so Arrow can show it
+            src["ref"] = src["ref"].astype(str)
+        st.dataframe(src, width="stretch", hide_index=True,
                      column_config={"url": st.column_config.LinkColumn("URL"),
                                     "ref": st.column_config.TextColumn("Ref #")})
     with t_trace:
