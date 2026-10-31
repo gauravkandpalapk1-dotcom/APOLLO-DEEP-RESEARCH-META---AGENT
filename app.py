@@ -37,6 +37,8 @@ with st.sidebar:
     review_plan = st.checkbox("Let me review the plan before searching", value=True)
     review_gaps = st.toggle("Review gaps between rounds", value=False,
                             help="Pause after each round to choose which gaps to follow up and edit their queries.")
+    st.header("Models")
+    models_slot = st.empty()
 
 
 def limits() -> Limits:
@@ -83,6 +85,43 @@ def show_graph(slot, plan):
         st.caption(LEGEND)
 
 
+# ---------------- models panel ----------------
+def tavily_searches(state) -> int:
+    """Web and news searches that reached Tavily this run (a call that failed used no credits)."""
+    return sum(x["source"] in ("web", "news") and x["status"] != "failed" for x in state.search_log) if state else 0
+
+
+def models_now() -> tuple[dict | None, int]:
+    """(model status, Tavily searches) for the finished report, or live from the current run."""
+    if ss.report:
+        return ss.report.stats.get("models"), tavily_searches(ss.report.state)
+    llm = getattr(ss.get("app"), "llm", None)
+    return (llm.status() if hasattr(llm, "status") else None), tavily_searches(ss.run)
+
+
+def role_tokens(u: dict) -> str:
+    return (f"{u.get('tokens', 0):,} tokens ({u.get('prompt_tokens', 0):,} in, "
+            f"{u.get('completion_tokens', 0):,} out), {u.get('calls', 0)} calls")
+
+
+def cost_text(status: dict) -> str:
+    return f"\\${status.get('cost_usd', 0):.4f}" + ("" if status.get("priced") else " (no prices set)")
+
+
+def show_models():
+    status, searches = models_now()
+    with models_slot.container():
+        if not status:
+            st.caption("No run yet.")
+            return
+        for role in ("strong", "fast"):
+            st.markdown(f"**{role.title()}:** `{status['active'].get(role, 'not used yet')}`  \n"
+                        + role_tokens(status["usage"].get(role, {})))
+        st.markdown(f"Model or key switches: **{status['switches']}**  \n"
+                    f"Estimated cost: **{cost_text(status)}**  \n"
+                    f"Tavily searches this run: **{searches}**")
+
+
 # ---------------- live log ----------------
 def log_line(e: dict):
     name, colour = ACTORS.get(e.get("actor"), ACTORS["system"])
@@ -99,6 +138,7 @@ def record(ev, metrics):
                      len({u for e in ss.events if e["kind"] == "search" for u in (e["data"] or {}).get("urls", [])}))
     m_gaps.metric("Gaps flagged", sum(e["kind"] == "gap" for e in ss.events))
     m_tokens.metric("Tokens used", f"{ss.app.budget.used:,}")
+    show_models()
 
 
 def run_one_round(app, state, graph_slot, metrics):
@@ -277,8 +317,15 @@ if rep:
                f"{s.get('sentences_unverified_removed', 0)} unverifiable sentences removed · {s.get('seconds')}s")
     m = s.get("models")
     if m:
+        c = st.columns(5)
+        c[0].metric("Strong tokens", f"{m['usage'].get('strong', {}).get('tokens', 0):,}")
+        c[1].metric("Fast tokens", f"{m['usage'].get('fast', {}).get('tokens', 0):,}")
+        c[2].metric("Model or key switches", m["switches"])
+        c[3].metric("Estimated cost", f"${m.get('cost_usd', 0):.4f}")
+        c[4].metric("Tavily searches", tavily_searches(rep.state))
         st.caption("Models used: " + ", ".join(f"{role} = {label}" for role, label in m["active"].items())
-                   + f" · model or key switches: {m['switches']}")
+                   + " · " + " · ".join(f"{role}: {role_tokens(u)}" for role, u in m["usage"].items())
+                   + ("" if m.get("priced") else " · no prices set, so the cost is 0"))
 
     t_report, t_evidence, t_sources, t_trace, t_removed = st.tabs(
         ["Report", "Evidence", "Sources", "Trace", "Removed sentences"])
@@ -358,3 +405,5 @@ if rep:
     if st.button("Start a new topic"):
         reset()
         st.rerun()
+
+show_models()

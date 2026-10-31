@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 
 from .config import (DISABLE_THINKING, LLM_MAX_CONCURRENCY, LLM_TIMEOUTS, PROVIDERS,
-                     THINKING_OFF, env)
+                     THINKING_OFF, env, price)
 
 PLACEHOLDER = re.compile(r"^[A-Z0-9_]+$")
 THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S | re.I)
@@ -70,6 +70,10 @@ def parse_json(text: str) -> dict:
     if more and isinstance(first, dict):
         first["_more_objects"] = more
     return first
+
+
+def _counter() -> dict:
+    return {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "tokens": 0}
 
 
 @dataclass(frozen=True)
@@ -171,7 +175,8 @@ class LLM:
         self._no_json_mode: set[tuple[str, str]] = set()
         self._no_thinking_switch: set[tuple[str, str]] = set()
         self._sticky: dict[str, Candidate] = {}
-        self.usage = {r: {"calls": 0, "tokens": 0} for r in ("strong", "fast")}
+        self.usage = {r: _counter() for r in ("strong", "fast")}       # per role
+        self.usage_by_model: dict[str, dict] = {}                       # per "provider:model"
         self.active: dict[str, str] = {}
         self.switches = 0
         self._notices: list[str] = []
@@ -209,9 +214,32 @@ class LLM:
             out, self._notices = self._notices, []
         return out
 
+    def _count(self, role: str, c: Candidate, usage):
+        """Add one reply's token usage to its role and its provider:model. Call with self._lock held."""
+        prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion = int(getattr(usage, "completion_tokens", 0) or 0)
+        total = int(getattr(usage, "total_tokens", 0) or 0) or prompt + completion
+        for counter in (self.usage[role], self.usage_by_model.setdefault(f"{c.provider}:{c.model}", _counter())):
+            counter["calls"] += 1
+            counter["prompt_tokens"] += prompt
+            counter["completion_tokens"] += completion
+            counter["tokens"] += total
+        return total
+
+    def cost(self) -> float:
+        """Estimated US dollars: prompt and completion tokens per provider:model times PRICE_IN/PRICE_OUT."""
+        total = 0.0
+        for name, u in self.usage_by_model.items():
+            price_in, price_out = price(name.split(":", 1)[0])
+            total += (u["prompt_tokens"] * price_in + u["completion_tokens"] * price_out) / 1e6
+        return total
+
     def status(self) -> dict:
-        return {"active": dict(self.active), "usage": {r: dict(u) for r, u in self.usage.items()},
-                "switches": self.switches, "warnings": list(self.warnings)}
+        with self._lock:
+            return {"active": dict(self.active), "usage": {r: dict(u) for r, u in self.usage.items()},
+                    "usage_by_model": {m: dict(u) for m, u in self.usage_by_model.items()},
+                    "cost_usd": self.cost(), "priced": any(any(price(p)) for p in self.providers),
+                    "switches": self.switches, "warnings": list(self.warnings)}
 
     # ---------- calls ----------
     def _request(self, c: Candidate, system: str, user: str, json_mode: bool, temperature: float):
@@ -292,12 +320,8 @@ class LLM:
                 return None
             text = (resp.choices[0].message.content or "") if resp.choices else ""
             text = THINK_BLOCK.sub("", text).strip()
-            usage = getattr(resp, "usage", None)
-            tokens = getattr(usage, "total_tokens", 0) or 0
-            self.budget.add(tokens)
             with self._lock:
-                self.usage[role]["calls"] += 1
-                self.usage[role]["tokens"] += tokens
+                self.budget.add(self._count(role, c, getattr(resp, "usage", None)))
                 if not text:
                     failures.append(f"{c.label}: empty reply")
                     self.switches += 1

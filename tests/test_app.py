@@ -16,6 +16,15 @@ REAL_LLM, REAL_SEARCH = pipeline.LLM, agents.run_search
 class UIFakeLLM(FakeLLM):
     warnings = []                                            # the app shows the real LLM's key warnings
 
+    def status(self):                                        # what the real LLM reports, for the Models panel
+        used = self.budget.used
+        return {"active": {"strong": "fake:strong-model #1", "fast": "fake:fast-model #1"}, "switches": 2,
+                "usage": {"strong": {"calls": 3, "prompt_tokens": used // 2, "completion_tokens": used // 4,
+                                     "tokens": used // 2 + used // 4},
+                          "fast": {"calls": 1, "prompt_tokens": used // 4, "completion_tokens": 0,
+                                   "tokens": used // 4}},
+                "usage_by_model": {}, "cost_usd": 0.0, "priced": False, "warnings": []}
+
 
 def _app(review_gaps: bool) -> AppTest:
     agents.run_search = fake_search
@@ -41,6 +50,30 @@ def _graphs(at: AppTest) -> list[str]:
 
 def _markdown(at: AppTest) -> str:
     return "\n".join(m.value for m in at.markdown)
+
+
+def _sidebar(at: AppTest) -> str:
+    return "\n".join([m.value for m in at.sidebar.markdown] + [c.value for c in at.sidebar.caption])
+
+
+def test_models_panel_live_and_after_the_run():
+    agents.run_search = fake_search
+    pipeline.LLM = lambda budget: UIFakeLLM()
+    assert "No run yet." in _sidebar(AppTest.from_file(APP, default_timeout=60).run())
+    at = _app(review_gaps=True)
+    _click(at, "Approve plan and start research")              # paused after round 1: the panel is live
+    side = _sidebar(at)
+    state = at.session_state["run"]
+    tavily = sum(x["source"] in ("web", "news") and x["status"] != "failed" for x in state.search_log)
+    assert tavily > 0 and f"Tavily searches this run: **{tavily}**" in side, side
+    assert "**Strong:** `fake:strong-model #1`" in side and "**Fast:** `fake:fast-model #1`" in side
+    assert "Model or key switches: **2**" in side and "(no prices set)" in side and "0.0000" in side
+    assert " in, " in side and " out)" in side                  # prompt and completion tokens shown
+    _click(at, "Write report now")
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Model or key switches"] == "2" and metrics["Estimated cost"] == "$0.0000", metrics
+    assert {"Strong tokens", "Fast tokens", "Tavily searches"} <= set(metrics), metrics
+    assert "Tavily searches this run" in _sidebar(at), "the panel stays after the run"
 
 
 def test_plan_review_shows_graph_and_editor():
@@ -122,7 +155,8 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     try:
-        for t in (test_plan_review_shows_graph_and_editor, test_plan_editor_accepts_any_source_subset,
+        for t in (test_models_panel_live_and_after_the_run, test_plan_review_shows_graph_and_editor,
+                  test_plan_editor_accepts_any_source_subset,
                   test_full_run_with_the_toggle_off,
                   test_gap_review_one_round_per_click, test_rerun_mid_round_does_not_crash):
             t()

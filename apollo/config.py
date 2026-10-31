@@ -68,3 +68,15 @@ def env(name: str, required: bool = True, default: str | None = None) -> str | N
     if required and not value:
         raise RuntimeError(f"Missing environment variable {name}. Copy .env.example to .env and fill it in.")
     return value
+
+
+def price(provider: str) -> tuple[float, float]:
+    """(input, output) price in US dollars per million tokens, from PRICE_IN_<PROVIDER> and PRICE_OUT_<PROVIDER>.
+    Unset, empty or unreadable values count as 0: free tiers cost nothing."""
+    out = []
+    for kind in ("IN", "OUT"):
+        try:
+            out.append(max(0.0, float(os.environ.get(f"PRICE_{kind}_{provider.upper()}") or 0)))
+        except ValueError:
+            out.append(0.0)
+    return out[0], out[1]
