@@ -1,18 +1,25 @@
 """Benchmark Apollo against the single-shot baseline on every topic in benchmark_topics.txt.
 Run: python -m scripts.benchmark [--topics benchmark_topics.txt] [--rounds N] [--sources web] [--limit N] [--seed 0]
+     python -m scripts.benchmark --apollo-runs runs/<folder> runs/<folder> ...   (reuse saved Apollo runs)
 
 Writes runs/benchmark-<timestamp>/: benchmark.csv, benchmark.md (markdown table + metric definitions),
 handcheck.csv (random kept sentences with their passages, "supported" left blank for a human), and each run's
 own folder under apollo/ and baseline/. A failed run is recorded as failed with its error; a number that was not
-measured (failed run, or a metric that does not apply to that system) is left blank."""
+measured (failed run, or a metric that does not apply to that system) is left blank.
+With --apollo-runs, Apollo is not run again: its numbers are read from those folders' saved files (provenance.json,
+stats.json, events.jsonl), the topics are theirs, and only the baseline runs live."""
 import argparse
 import csv
+import json
 import random
+import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
+from apollo import config
 from apollo.config import SOURCE_TYPES, Limits
 from apollo.pipeline import Apollo
 from apollo.state import domain_of
@@ -23,7 +30,8 @@ COLUMNS = ["topic", "system", "status", "error", "kept_claims", "drafted_claims"
            "unverified_removed", "domains_cited", "subqs_covered", "subqs_planned", "gaps_found", "gaps_closed",
            "contradictions", "tokens", "seconds", "strong_model", "fast_model", "run_dir"]
 HANDCHECK_COLUMNS = ["system", "topic", "sentence", "passage", "url", "supported"]
-HANDCHECK_PER_RUN = 10
+HANDCHECK_PER_RUN = 5
+SMALL_SAMPLE = ("{n} topic(s) is a small sample: the numbers show a direction, not a proven result.")
 
 DEFINITIONS = """- **supported-claim rate** = kept claims / drafted claims. A drafted claim is every sentence the writer
   produced except sentences that only say the sources did not cover something (no factual claim) and sentences
@@ -119,6 +127,44 @@ def run_apollo(topic: str, limits: Limits, runs_dir: Path, make_app=Apollo) -> t
     return row, rep.sentences
 
 
+def saved_apollo(run_dir: str | Path) -> tuple[dict, list[dict], dict]:
+    """Apollo's benchmark row from a run folder saved by scripts/run_topic.py, without running it again.
+    Returns (row, sentences, info about the run: folder, date, code version)."""
+    run_dir = Path(run_dir)
+    prov = json.loads((run_dir / "provenance.json").read_text(encoding="utf-8"))
+    stats = json.loads((run_dir / "stats.json").read_text(encoding="utf-8"))
+    events = [SimpleNamespace(**json.loads(line))
+              for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    final = {q["id"]: q["status"] for s in prov["plan"]["sections"] for q in s["sub_questions"]}
+    sentences = prov["sentences"]
+    kept, drafted, unverified = claim_counts(sentences)
+    found, closed = gap_counts(events, final)
+    row = _row(prov["topic"], "apollo", status="ok", kept_claims=kept, drafted_claims=drafted,
+               supported_claim_rate=round(kept / drafted, 3) if drafted else "", unverified_removed=unverified,
+               domains_cited=len({domain_of(r["url"]) for r in prov["references"]}),
+               subqs_covered=sum(s == "covered" for s in final.values()), subqs_planned=len(final),
+               gaps_found=found, gaps_closed=closed, contradictions=len(prov["contradictions"]),
+               tokens=stats.get("tokens_used", ""), seconds=stats.get("seconds", ""), run_dir=str(run_dir),
+               **_models(stats))
+    made = datetime.fromtimestamp((run_dir / "stats.json").stat().st_mtime)
+    return row, sentences, {"topic": prov["topic"], "dir": str(run_dir), "made": made, **code_at(made)}
+
+
+def code_at(when: datetime) -> dict:
+    """The last commit before `when` and the commits made after it (fixes the saved run does not have).
+    Empty if git isn't available."""
+    def log(*args) -> list[str]:
+        try:
+            out = subprocess.run(["git", "log", "--format=%h %ad %s", "--date=format:%Y-%m-%d %H:%M", *args],
+                                 capture_output=True, text=True, timeout=20, encoding="utf-8")
+            return out.stdout.strip().splitlines() if out.returncode == 0 else []
+        except (OSError, subprocess.SubprocessError):
+            return []
+    stamp = when.strftime("%Y-%m-%d %H:%M:%S")
+    before = log("-1", f"--before={stamp}")
+    return {"commit_before": before[0] if before else "", "commits_after": log(f"--after={stamp}")}
+
+
 def run_baseline(topic: str, limits: Limits, runs_dir: Path, make_llm=None) -> tuple[dict, list[dict]]:
     started = time.time()
     try:
@@ -137,8 +183,24 @@ def run_baseline(topic: str, limits: Limits, runs_dir: Path, make_llm=None) -> t
     return row, result["sentences"]
 
 
+def baseline_wins(rows: list[dict]) -> list[str]:
+    """Every topic and metric where the baseline did better than Apollo (both runs ok)."""
+    better = {"supported_claim_rate": ("supported-claim rate", max), "domains_cited": ("domains cited", max),
+              "tokens": ("tokens", min), "seconds": ("seconds", min)}
+    out = []
+    for topic in dict.fromkeys(r["topic"] for r in rows):
+        pair = {r["system"]: r for r in rows if r["topic"] == topic and r["status"] == "ok"}
+        if {"apollo", "baseline"} <= set(pair):
+            for key, (name, best) in better.items():
+                a, b = pair["apollo"][key], pair["baseline"][key]
+                if a != "" and b != "" and float(a) != float(b) and best(float(a), float(b)) == float(b):
+                    out.append(f"{topic}: {name} (baseline {b}, Apollo {a})")
+    return out
+
+
 def handcheck_rows(system: str, topic: str, sentences: list[dict], rng: random.Random) -> list[dict]:
-    """Up to 10 random kept claims, each with all the passages it cites; "supported" is for a human to fill in."""
+    """Up to HANDCHECK_PER_RUN random kept claims, each with all the passages it cites; "supported" is for a human
+    to fill in."""
     kept = [x for x in sentences if x["verdict"] == "kept" and x["evidence"]]
     picked = rng.sample(kept, min(HANDCHECK_PER_RUN, len(kept)))
     return [{"system": system, "topic": topic, "sentence": plain_sentence(x["text_with_refs"]),
@@ -183,12 +245,21 @@ def read_topics(path: str | Path) -> list[str]:
 
 
 def run_benchmark(topics: list[str], limits: Limits, out_dir: str | Path, seed: int = 0,
-                  make_app=Apollo, make_llm=None) -> Path:
+                  make_app=Apollo, make_llm=None, apollo_runs: list[str | Path] | None = None) -> Path:
+    """apollo_runs: saved Apollo run folders to reuse instead of running Apollo; their topics replace `topics`."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    saved = {}
+    for d in apollo_runs or []:
+        row, sentences, info = saved_apollo(d)
+        saved[row["topic"]] = (row, sentences, info)
+    if saved:
+        topics = list(saved)
     rows, checks = [], []
     for i, topic in enumerate(topics):
-        for system, runner in (("apollo", lambda: run_apollo(topic, limits, out / "apollo", make_app)),
+        apollo = (lambda: saved[topic][:2]) if topic in saved else (lambda: run_apollo(topic, limits, out / "apollo",
+                                                                                        make_app))
+        for system, runner in (("apollo", apollo),
                                ("baseline", lambda: run_baseline(topic, limits, out / "baseline", make_llm))):
             print(f"\n===== [{i + 1}/{len(topics)}] {system}: {topic}", flush=True)
             row, sentences = runner()
@@ -206,13 +277,32 @@ def run_benchmark(topics: list[str], limits: Limits, out_dir: str | Path, seed: 
         w.writeheader()
         w.writerows(checks)
     failed = [r for r in rows if r["status"] == "failed"]
-    md = ["# Apollo vs single-shot baseline", "",
-          f"{len(topics)} topic(s), sources: {', '.join(limits.enabled_sources)}, max rounds: {limits.max_rounds}, "
-          f"run {datetime.now():%Y-%m-%d %H:%M}.", "", _md_table(rows), "", "## Means", "", _means(rows), "",
+    wins = baseline_wins(rows)
+    setup = (f"{len(topics)} topic(s), Tavily search depth: {config.SEARCH_DEPTH}, run {datetime.now():%Y-%m-%d %H:%M}. "
+             + ("Apollo: saved runs (not run again, see below); baseline: run now." if saved else
+                f"Apollo sources: {', '.join(limits.enabled_sources)}, max rounds: {limits.max_rounds}."))
+    md = ["# Apollo vs single-shot baseline", "", setup, "", _md_table(rows), "",
+          SMALL_SAMPLE.format(n=len(topics)) + " Rows where the baseline did better: "
+          + ("; ".join(wins) if wins else "none") + ".", "",
+          "## Means", "", _means(rows), "",
           "## Failed runs", "", "\n".join(f"- {r['system']} / {r['topic']}: {r['error']}" for r in failed) or "None.",
-          "", "## How each number is measured", "", DEFINITIONS, "",
+          ""]
+    if saved:
+        md += ["## Saved Apollo runs", "",
+               "These Apollo runs were made earlier and read from their saved files (their tokens and seconds come "
+               "from each run's stats.json); the code has changed since. A run may also include changes that were "
+               "not yet committed when it was made.", ""]
+        for row, _, info in saved.values():
+            later = info["commits_after"]
+            md += [f"- **{info['topic']}**: `{info['dir']}`, made {info['made']:%Y-%m-%d %H:%M}; last commit before "
+                   f"it: {info['commit_before'] or 'unknown'}. "
+                   + (f"Committed since ({len(later)}), not in this run: " + "; ".join(later) if later else
+                      "No commits since.")]
+        md.append("")
+    md += ["## How each number is measured", "", DEFINITIONS, "",
           f"Hand check: `handcheck.csv` has up to {HANDCHECK_PER_RUN} random kept sentences per system per topic "
-          f"with the passages they cite; fill in the *supported* column (yes/no) by reading them.", ""]
+          f"with the passages they cite; fill in the *supported* column (yes/no) by reading them, then run "
+          f"`python -m scripts.handcheck_summary` to add the results to this file.", ""]
     (out / "benchmark.md").write_text("\n".join(md), encoding="utf-8")
     return out
 
@@ -227,12 +317,18 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"Apollo's source types, from: {', '.join(SOURCE_TYPES)} (the baseline always uses one web search)")
     p.add_argument("--limit", type=int, default=0, help="only the first N topics")
     p.add_argument("--seed", type=int, default=0, help="seed for picking hand-check sentences")
+    p.add_argument("--apollo-runs", nargs="+", default=None, metavar="RUN_DIR",
+                   help="saved Apollo run folders to reuse instead of running Apollo (their topics are used)")
     args = p.parse_args(argv)
-    topics = read_topics(args.topics)[:args.limit or None]
-    if not topics:
+    for d in args.apollo_runs or []:
+        if not (Path(d) / "provenance.json").exists():
+            p.error(f"{d} is not a saved Apollo run (no provenance.json)")
+    topics = [] if args.apollo_runs else read_topics(args.topics)[:args.limit or None]
+    if not topics and not args.apollo_runs:
         p.error(f"no topics in {args.topics}")
     out = run_benchmark(topics, Limits(max_rounds=args.rounds, enabled_sources=args.sources),
-                        Path("runs") / f"benchmark-{datetime.now():%Y%m%d-%H%M%S}", seed=args.seed)
+                        Path("runs") / f"benchmark-{datetime.now():%Y%m%d-%H%M%S}", seed=args.seed,
+                        apollo_runs=args.apollo_runs)
     print("\n" + (out / "benchmark.md").read_text(encoding="utf-8"))
     print(f"Saved to {out}")
     return 0

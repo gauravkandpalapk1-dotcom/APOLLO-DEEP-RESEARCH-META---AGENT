@@ -14,7 +14,7 @@ from apollo.pipeline import Apollo
 from apollo.search import Doc, SearchError
 from apollo.state import Event
 from apollo.writer import NO_CLAIM, UNVERIFIED
-from scripts import baseline, benchmark
+from scripts import baseline, benchmark, handcheck_summary, run_topic
 from tests.test_offline import FakeLLM, fake_search
 from tests.test_run_topic import PlanFailsLLM
 
@@ -110,7 +110,7 @@ def test_benchmark_records_failures_and_never_invents_numbers():
         counts = {}
         for c in checks:
             counts[(c["system"], c["topic"])] = counts.get((c["system"], c["topic"]), 0) + 1
-        assert all(n <= benchmark.HANDCHECK_PER_RUN for n in counts.values()) and counts[("baseline", "Farm technology")] == 10
+        assert all(n <= benchmark.HANDCHECK_PER_RUN for n in counts.values()) and counts[("baseline", "Farm technology")] == benchmark.HANDCHECK_PER_RUN
         assert not any(c["topic"] == "a broken topic" for c in checks)
 
         md = (out / "benchmark.md").read_text(encoding="utf-8")
@@ -123,8 +123,74 @@ def test_handcheck_sample_is_reproducible():
               "evidence": [{"passage": f"p{k}", "url": "https://a.example/"}]} for k in range(30)]
     pick = lambda seed: [r["sentence"] for r in benchmark.handcheck_rows(
         "apollo", "t", sents, benchmark.random.Random(f"{seed}|apollo|t"))]
-    assert pick(0) == pick(0) and len(pick(0)) == 10 and pick(0) != pick(1)
+    assert pick(0) == pick(0) and len(pick(0)) == benchmark.HANDCHECK_PER_RUN and pick(0) != pick(1)
     assert pick(0)[0].startswith("Fact ") and "[[" not in pick(0)[0]
+
+
+def test_saved_apollo_runs_are_reused_not_rerun():
+    agents.run_search, baseline.fetch = fake_search, fake_fetch
+    with tempfile.TemporaryDirectory() as tmp:
+        live, _ = benchmark.run_apollo("Farm technology", LIMITS, Path(tmp) / "runs",
+                                       make_app=lambda limits: Apollo(limits, llm=FakeLLM()))
+        saved = Path(live["run_dir"])
+        again, _, info = benchmark.saved_apollo(saved)       # the saved files give the same numbers as the live run
+        same = [c for c in benchmark.COLUMNS if c not in ("seconds", "error")]
+        assert {c: again[c] for c in same} == {c: live[c] for c in same}, (again, live)
+        assert info["topic"] == "Farm technology" and info["dir"] == str(saved)
+
+        def never(limits):
+            raise AssertionError("Apollo must not run again when its saved run is given")
+        out = benchmark.run_benchmark(["ignored topic"], LIMITS, Path(tmp) / "bench", make_app=never,
+                                      make_llm=BaselineLLM, apollo_runs=[saved])
+        rows = list(csv.DictReader(open(out / "benchmark.csv", encoding="utf-8")))
+        assert [(r["topic"], r["system"]) for r in rows] == [("Farm technology", "apollo"),
+                                                             ("Farm technology", "baseline")]
+        apollo = rows[0]
+        stats = json.loads((saved / "stats.json").read_text(encoding="utf-8"))
+        assert apollo["status"] == "ok" and apollo["run_dir"] == str(saved)
+        assert apollo["kept_claims"] == str(live["kept_claims"]) and int(apollo["tokens"]) == stats["tokens_used"]
+        assert float(apollo["seconds"]) == stats["seconds"], "a saved run's seconds come from its stats.json"
+        md = (out / "benchmark.md").read_text(encoding="utf-8")
+        assert "## Saved Apollo runs" in md and str(saved) in md and "not run again" in md
+        assert "1 topic(s) is a small sample: the numbers show a direction, not a proven result." in md
+        assert "Rows where the baseline did better: " in md and "Farm technology: tokens (baseline 2500, Apollo" in md
+        checks = list(csv.DictReader(open(out / "handcheck.csv", encoding="utf-8")))
+        assert {c["system"] for c in checks} == {"apollo", "baseline"}
+        assert all(sum(c["system"] == s for c in checks) <= benchmark.HANDCHECK_PER_RUN for s in ("apollo", "baseline"))
+
+
+def test_baseline_wins_lists_every_better_metric():
+    row = lambda system, **kw: {**{c: "" for c in benchmark.COLUMNS}, "topic": "t", "system": system, "status": "ok",
+                                **kw}
+    rows = [row("apollo", supported_claim_rate="0.8", domains_cited="20", tokens="90000", seconds="200"),
+            row("baseline", supported_claim_rate="0.9", domains_cited="8", tokens="9000", seconds="20")]
+    assert benchmark.baseline_wins(rows) == ["t: supported-claim rate (baseline 0.9, Apollo 0.8)",
+                                             "t: tokens (baseline 9000, Apollo 90000)",
+                                             "t: seconds (baseline 20, Apollo 200)"]
+    rows[1]["status"] = "failed"
+    assert benchmark.baseline_wins(rows) == [], "no comparison with a failed run"
+
+
+def test_handcheck_summary_counts_only_checked_rows():
+    with tempfile.TemporaryDirectory() as tmp:
+        bench = Path(tmp) / "benchmark-1"
+        bench.mkdir()
+        (bench / "benchmark.md").write_text("# Apollo vs single-shot baseline\n\n| table |\n", encoding="utf-8")
+        answers = {("apollo", "A"): ["yes", "Y", "no", "", "maybe"], ("baseline", "A"): ["no", "no", "1", "", ""]}
+        with open(bench / "handcheck.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=benchmark.HANDCHECK_COLUMNS)
+            w.writeheader()
+            for (system, topic), values in answers.items():
+                for v in values:
+                    w.writerow({"system": system, "topic": topic, "sentence": "s", "passage": "p", "url": "u",
+                                "supported": v})
+        assert handcheck_summary.newest_benchmark(tmp) == bench
+        handcheck_summary.append_summary(bench)
+        handcheck_summary.append_summary(bench)                  # run again: replaced, not added twice
+        md = (bench / "benchmark.md").read_text(encoding="utf-8")
+        assert md.count("## Hand check") == 1 and md.startswith("# Apollo vs single-shot baseline")
+        assert "| A | apollo | 2/3 | 5 | 2 |" in md and "| A | baseline | 1/3 | 5 | 2 |" in md, md
+        assert "**apollo**: 2/3 checked sentences supported (67%)" in md
 
 
 def main():
@@ -132,7 +198,8 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for t in (test_baseline_writes_files_and_verifies, test_baseline_failure_saves_events_and_error,
               test_metric_helpers, test_benchmark_records_failures_and_never_invents_numbers,
-              test_handcheck_sample_is_reproducible):
+              test_handcheck_sample_is_reproducible, test_saved_apollo_runs_are_reused_not_rerun,
+              test_baseline_wins_lists_every_better_metric, test_handcheck_summary_counts_only_checked_rows):
         t()
         print("ok  ", t.__name__)
     print("ALL BENCHMARK TESTS PASSED")

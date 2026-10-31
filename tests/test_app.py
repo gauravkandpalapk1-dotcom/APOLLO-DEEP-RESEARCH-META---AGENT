@@ -114,7 +114,10 @@ def test_brief_frontend_checklist():
     assert {"web", "arxiv", "edgar"} <= sources, sources       # several source types searched in one run
     _click(at, "Write report now")
     rep = at.session_state["report"]
-    assert [t.label for t in at.tabs] == ["Report", "Evidence", "Sources", "Trace", "Removed sentences"]
+    tabs = [t.label for t in at.tabs]                         # tree order: the result tabs sit inside "Research"
+    assert {"Research", "Benchmark"} <= set(tabs)
+    assert [t for t in tabs if t not in ("Research", "Benchmark")] == ["Report", "Evidence", "Sources", "Trace",
+                                                                       "Removed sentences"]
     report = _markdown(at)
     assert "## References" in report and "[[1]](https://" in report, "clickable citations and references"
     src = next(d.value for d in at.dataframe if "url" in d.value.columns)
@@ -123,6 +126,29 @@ def test_brief_frontend_checklist():
     downloads = [e.proto.label for e in at.get("download_button")]
     assert downloads == ["Download Markdown", "Download PDF", "Download provenance JSON"], downloads
     assert markdown_to_pdf(rep.markdown)[:5] == b"%PDF-"
+
+
+def test_benchmark_tab_shows_the_newest_benchmark():
+    import tempfile
+    from scripts import handcheck_summary
+    real = handcheck_summary.newest_benchmark
+    try:
+        handcheck_summary.newest_benchmark = lambda runs_dir="runs": None
+        at = AppTest.from_file(APP, default_timeout=60).run()
+        assert any("No benchmark has been run yet" in i.value for i in at.info)
+        with tempfile.TemporaryDirectory() as tmp:
+            bench = Path(tmp) / "benchmark-20261101-000000"
+            bench.mkdir()
+            (bench / "benchmark.md").write_text("# Apollo vs single-shot baseline\n\nCosts $4.2 and $7.8 here.\n",
+                                                encoding="utf-8")
+            handcheck_summary.newest_benchmark = lambda runs_dir="runs": bench
+            at = AppTest.from_file(APP, default_timeout=60).run()
+            assert not at.exception
+            md = "\n".join(m.value for m in at.markdown)
+            assert "# Apollo vs single-shot baseline" in md and "\\$4.2" in md, "shown, with $ not read as LaTeX"
+            assert any(str(bench) in c.value for c in at.caption)
+    finally:
+        handcheck_summary.newest_benchmark = real
 
 
 def test_full_run_with_the_toggle_off():
@@ -186,6 +212,7 @@ def main():
     try:
         for t in (test_models_panel_live_and_after_the_run, test_plan_review_shows_graph_and_editor,
                   test_plan_editor_accepts_any_source_subset, test_brief_frontend_checklist,
+                  test_benchmark_tab_shows_the_newest_benchmark,
                   test_full_run_with_the_toggle_off,
                   test_gap_review_one_round_per_click, test_rerun_mid_round_does_not_crash):
             t()

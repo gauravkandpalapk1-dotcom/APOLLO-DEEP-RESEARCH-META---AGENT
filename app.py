@@ -9,6 +9,7 @@ from apollo.agents import PlanError, plan_from_rows, plan_rows
 from apollo.config import SOURCE_TYPES, Limits
 from apollo.pipeline import Apollo, provenance
 from apollo.writer import highlight, plain_sentence
+from scripts.handcheck_summary import newest_benchmark
 
 st.set_page_config(page_title="Apollo research", page_icon="🔭", layout="wide")
 
@@ -192,224 +193,237 @@ st.title("Apollo")
 st.caption("Give it a topic. Apollo plans the report, Athena searches, Hermes checks for gaps, "
            "and every sentence in the final report links to the source that supports it.")
 
-topic = st.text_input("Research topic", placeholder="Impact of AI on Indian agriculture")
-col_a, col_b = st.columns([1, 5])
-if col_a.button("Plan research", type="primary", disabled=not topic.strip()):
-    reset()
-    try:
-        with st.spinner("Apollo is planning sections and sub-questions…"):
-            app = Apollo(limits())
-            for w in app.llm.warnings:
-                st.warning(w)
-            ss.plan = app.plan(topic.strip())
-            ss.rows = plan_rows(ss.plan)
-            ss.app = app
-    except PlanError as e:
-        st.error(f"Planning failed: {e}. Try rephrasing the topic.")
-    except RuntimeError as e:
-        st.error(str(e))
+research_tab, benchmark_tab = st.tabs(["Research", "Benchmark"])
 
-# ---------------- human-in-the-loop plan review ----------------
-start = False
-if ss.plan and ss.run is None and not ss.report:
-    if review_plan:
-        st.subheader("Review the plan")
-        editor_col, graph_col = st.columns([3, 2])
-        with editor_col:
-            st.caption("Edit, add or delete rows. c1 and c2 are the acceptance criteria (leave a cell empty for "
-                       "none). Pick any sources for each sub-question; only those enabled in the sidebar are "
-                       "searched (" + ", ".join(sources or ["web"]) + ").")
-            table = pd.DataFrame(ss.rows)
-            table["sources"] = table["sources"].map(lambda s: [t.strip() for t in str(s).split(",") if t.strip()])
-            edited = st.data_editor(table, num_rows="dynamic", width="stretch", key="plan_editor",
-                                    column_config={"sources": st.column_config.MultiselectColumn(
-                                        "sources", options=list(SOURCE_TYPES), default=["web"])})
-            start = st.button("Approve plan and start research", type="primary")
-        edited["sources"] = edited["sources"].map(lambda v: ", ".join(v) if isinstance(v, (list, tuple))
-                                                  else str(v or ""))
-        rows = edited.fillna("").to_dict("records")
+with research_tab:
+    topic = st.text_input("Research topic", placeholder="Impact of AI on Indian agriculture")
+    col_a, col_b = st.columns([1, 5])
+    if col_a.button("Plan research", type="primary", disabled=not topic.strip()):
+        reset()
         try:
-            draft = plan_from_rows(ss.plan.topic, rows, limits())
-        except PlanError:
-            draft = ss.plan
-        with graph_col:
-            show_graph(st.empty(), draft)
-        if start:
+            with st.spinner("Apollo is planning sections and sub-questions…"):
+                app = Apollo(limits())
+                for w in app.llm.warnings:
+                    st.warning(w)
+                ss.plan = app.plan(topic.strip())
+                ss.rows = plan_rows(ss.plan)
+                ss.app = app
+        except PlanError as e:
+            st.error(f"Planning failed: {e}. Try rephrasing the topic.")
+        except RuntimeError as e:
+            st.error(str(e))
+
+    # ---------------- human-in-the-loop plan review ----------------
+    start = False
+    if ss.plan and ss.run is None and not ss.report:
+        if review_plan:
+            st.subheader("Review the plan")
+            editor_col, graph_col = st.columns([3, 2])
+            with editor_col:
+                st.caption("Edit, add or delete rows. c1 and c2 are the acceptance criteria (leave a cell empty for "
+                           "none). Pick any sources for each sub-question; only those enabled in the sidebar are "
+                           "searched (" + ", ".join(sources or ["web"]) + ").")
+                table = pd.DataFrame(ss.rows)
+                table["sources"] = table["sources"].map(lambda s: [t.strip() for t in str(s).split(",") if t.strip()])
+                edited = st.data_editor(table, num_rows="dynamic", width="stretch", key="plan_editor",
+                                        column_config={"sources": st.column_config.MultiselectColumn(
+                                            "sources", options=list(SOURCE_TYPES), default=["web"])})
+                start = st.button("Approve plan and start research", type="primary")
+            edited["sources"] = edited["sources"].map(lambda v: ", ".join(v) if isinstance(v, (list, tuple))
+                                                      else str(v or ""))
+            rows = edited.fillna("").to_dict("records")
             try:
-                ss.plan = plan_from_rows(ss.plan.topic, rows, limits())
-            except PlanError as e:
-                st.error(f"The edited plan isn't usable: {e}")
-                start = False
+                draft = plan_from_rows(ss.plan.topic, rows, limits())
+            except PlanError:
+                draft = ss.plan
+            with graph_col:
+                show_graph(st.empty(), draft)
+            if start:
+                try:
+                    ss.plan = plan_from_rows(ss.plan.topic, rows, limits())
+                except PlanError as e:
+                    st.error(f"The edited plan isn't usable: {e}")
+                    start = False
+        else:
+            start = True
+
+    # ---------------- the run: one round per script run when gaps are reviewed ----------------
+    if start:
+        ss.app.limits = limits()
+        ss.app.budget.limit = ss.app.limits.token_budget
+        ss.run, ss.events, ss.gate_log, ss.phase = ss.app.start_run(ss.plan), [], [], "start"
+        st.rerun()                                       # redraw without the plan editor before searching starts
+
+    if ss.run is not None and not ss.report:
+        app, state = ss.app, ss.run
+        interrupted = ss.phase in ("round", "writing")
+        action, ss.action = ss.action, None
+        live, side = st.columns([3, 2])
+        with side:
+            graph_slot = st.empty()
+            show_graph(graph_slot, state.plan)
+            metrics = (st.empty(), st.empty(), st.empty(), st.empty())
+        with live:
+            if ss.events:
+                with st.expander(f"Run log so far ({len(ss.events)} events)", expanded=False):
+                    for e in ss.events:
+                        log_line(e)
+            if interrupted and action != "write":
+                st.warning("The last step was interrupted (the page reran while Apollo was working). Write the report "
+                           "from what was found so far, or start a new topic.")
+                st.button("Write report from what was found", type="primary",
+                          on_click=lambda: ss.update(action="write"))
+            else:
+                if action == "write":
+                    resume_clock(state)
+                    ss.gate_log.append({"round": state.round, "approved": 0, "edited": 0,
+                                        "choice": "write after interruption" if interrupted else "write report now"})
+                    app.approve_gaps(state, [], write_now=True)
+                elif action == "next":
+                    resume_clock(state)
+                    rows = gap_choices()
+                    approved = [r["id"] for r in rows if r["approve"]]
+                    original = {g["id"]: g["query"] for g in state.pending_gaps}
+                    edits = {r["id"]: r["query"] for r in rows if str(r["query"]).strip() != original.get(r["id"])}
+                    ss.gate_log.append({"round": state.round, "choice": "run next round", "approved": len(approved),
+                                        "edited": len(edits)})
+                    app.approve_gaps(state, approved, edits)
+                if ss.phase == "start" or action == "next":
+                    while not state.done:
+                        run_one_round(app, state, graph_slot, metrics)
+                        if state.done or review_gaps:
+                            break
+                        app.approve_gaps(state, [g["id"] for g in state.pending_gaps], {})
+                if state.done:
+                    write_report(app, state, metrics)
+                    st.rerun()
+                elif ss.phase == "gaps":
+                    st.subheader(f"Gaps after round {state.round}")
+                    st.caption("Untick a gap to skip it; edit a query to search for something else. Apollo follows up "
+                               "at most one gap per sub-question (the most important one).")
+                    st.data_editor(pd.DataFrame(ss.gap_rows), key=f"gap_editor_{state.round}", hide_index=True,
+                                   width="stretch", disabled=["id", "type", "sub-question", "detail"],
+                                   column_config={"approve": st.column_config.CheckboxColumn("follow up")})
+                    b1, b2, _ = st.columns([1, 1, 3])
+                    b1.button("Run next round", type="primary", on_click=lambda: ss.update(action="next"))
+                    b2.button("Write report now", on_click=lambda: ss.update(action="write"))
+        if st.button("Start a new topic", key="new_topic_running"):
+            reset()
+            st.rerun()
+
+    # ---------------- results ----------------
+    rep = ss.report
+    if rep:
+        s = rep.stats
+        c = st.columns(6)
+        c[0].metric("Rounds", s.get("rounds"))
+        c[1].metric("Sources collected", s.get("sources_collected"))
+        c[2].metric("Sources cited", s.get("sources_cited", 0))
+        c[3].metric("Sentences kept", s.get("sentences_kept", 0))
+        c[4].metric("Removed in verification", s.get("sentences_removed", 0))
+        c[5].metric("Tokens", f"{s.get('tokens_used', 0):,}")
+        st.caption(f"Stop condition: {s.get('stop_reason')} · {s.get('failed_searches')} failed searches · "
+                   f"{s.get('sentences_unverified_removed', 0)} unverifiable sentences removed · {s.get('seconds')}s")
+        m = s.get("models")
+        if m:
+            c = st.columns(5)
+            c[0].metric("Strong tokens", f"{m['usage'].get('strong', {}).get('tokens', 0):,}")
+            c[1].metric("Fast tokens", f"{m['usage'].get('fast', {}).get('tokens', 0):,}")
+            c[2].metric("Model or key switches", m["switches"])
+            c[3].metric("Estimated cost", f"${m.get('cost_usd', 0):.4f}")
+            c[4].metric("Tavily searches", tavily_searches(rep.state))
+            st.caption("Models used: " + ", ".join(f"{role} = {label}" for role, label in m["active"].items())
+                       + " · " + " · ".join(f"{role}: {role_tokens(u)}" for role, u in m["usage"].items())
+                       + ("" if m.get("priced") else " · no prices set, so the cost is 0"))
+
+        t_report, t_evidence, t_sources, t_trace, t_removed = st.tabs(
+            ["Report", "Evidence", "Sources", "Trace", "Removed sentences"])
+        with t_report:
+            st.markdown(no_latex(rep.markdown))
+            d1, d2, d3 = st.columns(3)
+            d1.download_button("Download Markdown", rep.markdown, file_name="apollo_report.md", mime="text/markdown")
+            d3.download_button("Download provenance JSON",
+                               json.dumps(provenance(rep), indent=2, default=str, ensure_ascii=False),
+                               file_name=f"apollo_provenance_{rep.state.run_id}.json", mime="application/json")
+            try:
+                from apollo.export import markdown_to_pdf
+                d2.download_button("Download PDF", markdown_to_pdf(rep.markdown), file_name="apollo_report.pdf",
+                                   mime="application/pdf")
+            except Exception as e:
+                d2.caption(f"PDF export unavailable: {e}")
+        with t_evidence:
+            st.caption("Open any sentence to see the exact passages it cites. Words the sentence shares with a "
+                       "passage are in bold.")
+            sentences = rep.sentences
+            sections = list(dict.fromkeys(x["section"] for x in sentences))
+            f1, f2 = st.columns([3, 1])
+            pick = f1.selectbox("Section", ["All sections"] + sections, key="ev_section")
+            show_removed = f2.toggle("Show removed sentences", key="ev_removed")
+            shown = [x for x in sentences if pick in ("All sections", x["section"])]
+            for x in (x for x in shown if x["verdict"] == "kept"):
+                plain = plain_sentence(x["text_with_refs"])
+                with st.expander(no_latex(f"{x['section']}: {plain[:160]}{'…' if len(plain) > 160 else ''}")):
+                    st.markdown(no_latex(x["text_with_refs"]))
+                    if not x["evidence"]:
+                        st.caption(f"No cited passage: this sentence {x['reason']}.")
+                    for ev in x["evidence"]:
+                        ref = f"[{ev['ref_number']}] " if ev["ref_number"] else ""
+                        st.markdown(f"**{ref}[{ev['title'] or ev['url']}]({ev['url']})** · {ev['domain']} · "
+                                    f"{ev['published'] or 'date unknown'}")
+                        st.markdown("> " + no_latex(highlight(ev["passage"], x["text_with_refs"])))
+            if show_removed:
+                st.subheader("Removed sentences")
+                removed_rows = [x for x in shown if x["verdict"] == "removed"]
+                for x in removed_rows:
+                    st.markdown(no_latex(f"- **{x['section']}**: {plain_sentence(x['text_with_refs'])}  \n  "
+                                         f"*Removed: {x['reason']}*"))
+                if not removed_rows:
+                    st.write("No sentences were removed in this section.")
+        with t_sources:
+            src = pd.DataFrame(rep.sources)
+            for col in src.columns:   # e.g. ref numbers or years mixed with "": one text column so Arrow can show it
+                if src[col].dropna().map(type).nunique() > 1:
+                    src[col] = src[col].fillna("").astype(str)
+            st.dataframe(src, width="stretch", hide_index=True,
+                         column_config={"url": st.column_config.LinkColumn("URL"),
+                                        "ref": st.column_config.TextColumn("Ref #")})
+        with t_trace:
+            g_col, r_col = st.columns([2, 3])
+            show_graph(g_col.empty(), rep.state.plan)
+            gate = {g["round"]: g for g in ss.gate_log}
+            r_col.dataframe(pd.DataFrame([{
+                "round": r["round"],
+                "queries sent": ", ".join(f"{src} {n}" for src, n in r["queries"].items()) or "0",
+                "new domains": r["new_domains"],
+                "gaps by type": ", ".join(f"{t} {n}" for t, n in r["gaps"].items()) or "none",
+                "decision": r["decision"], "reason": r["reason"],
+                **({"your choice": (f"{gate[r['round']]['choice']} ({gate[r['round']]['approved']} approved, "
+                                    f"{gate[r['round']]['edited']} edited)" if r["round"] in gate else "")}
+                   if gate else {})} for r in rep.state.round_log]), width="stretch", hide_index=True)
+            st.dataframe(pd.DataFrame([{"t": e["t"], "actor": ACTORS.get(e.get("actor"), ACTORS["system"])[0],
+                                        "kind": e["kind"], "text": e["text"]} for e in ss.events]),
+                         width="stretch", hide_index=True)
+            for log in rep.state.review_log:
+                with st.expander(f"Hermes review, round {log['round']}, section {log['section']}"):
+                    st.json(log["review"])
+        with t_removed:
+            if rep.removed:
+                st.dataframe(pd.DataFrame(rep.removed), width="stretch", hide_index=True)
+            else:
+                st.write("Verification removed nothing.")
+
+        if st.button("Start a new topic"):
+            reset()
+            st.rerun()
+
+# ---------------- benchmark ----------------
+with benchmark_tab:
+    bench_dir = newest_benchmark()
+    if bench_dir is None:
+        st.info("No benchmark has been run yet. Run `python -m scripts.benchmark` (or with `--apollo-runs` to "
+                "reuse saved Apollo runs); the newest `runs/benchmark-*/benchmark.md` is shown here.")
     else:
-        start = True
-
-# ---------------- the run: one round per script run when gaps are reviewed ----------------
-if start:
-    ss.app.limits = limits()
-    ss.app.budget.limit = ss.app.limits.token_budget
-    ss.run, ss.events, ss.gate_log, ss.phase = ss.app.start_run(ss.plan), [], [], "start"
-    st.rerun()                                       # redraw without the plan editor before searching starts
-
-if ss.run is not None and not ss.report:
-    app, state = ss.app, ss.run
-    interrupted = ss.phase in ("round", "writing")
-    action, ss.action = ss.action, None
-    live, side = st.columns([3, 2])
-    with side:
-        graph_slot = st.empty()
-        show_graph(graph_slot, state.plan)
-        metrics = (st.empty(), st.empty(), st.empty(), st.empty())
-    with live:
-        if ss.events:
-            with st.expander(f"Run log so far ({len(ss.events)} events)", expanded=False):
-                for e in ss.events:
-                    log_line(e)
-        if interrupted and action != "write":
-            st.warning("The last step was interrupted (the page reran while Apollo was working). Write the report "
-                       "from what was found so far, or start a new topic.")
-            st.button("Write report from what was found", type="primary",
-                      on_click=lambda: ss.update(action="write"))
-        else:
-            if action == "write":
-                resume_clock(state)
-                ss.gate_log.append({"round": state.round, "approved": 0, "edited": 0,
-                                    "choice": "write after interruption" if interrupted else "write report now"})
-                app.approve_gaps(state, [], write_now=True)
-            elif action == "next":
-                resume_clock(state)
-                rows = gap_choices()
-                approved = [r["id"] for r in rows if r["approve"]]
-                original = {g["id"]: g["query"] for g in state.pending_gaps}
-                edits = {r["id"]: r["query"] for r in rows if str(r["query"]).strip() != original.get(r["id"])}
-                ss.gate_log.append({"round": state.round, "choice": "run next round", "approved": len(approved),
-                                    "edited": len(edits)})
-                app.approve_gaps(state, approved, edits)
-            if ss.phase == "start" or action == "next":
-                while not state.done:
-                    run_one_round(app, state, graph_slot, metrics)
-                    if state.done or review_gaps:
-                        break
-                    app.approve_gaps(state, [g["id"] for g in state.pending_gaps], {})
-            if state.done:
-                write_report(app, state, metrics)
-                st.rerun()
-            elif ss.phase == "gaps":
-                st.subheader(f"Gaps after round {state.round}")
-                st.caption("Untick a gap to skip it; edit a query to search for something else. Apollo follows up "
-                           "at most one gap per sub-question (the most important one).")
-                st.data_editor(pd.DataFrame(ss.gap_rows), key=f"gap_editor_{state.round}", hide_index=True,
-                               width="stretch", disabled=["id", "type", "sub-question", "detail"],
-                               column_config={"approve": st.column_config.CheckboxColumn("follow up")})
-                b1, b2, _ = st.columns([1, 1, 3])
-                b1.button("Run next round", type="primary", on_click=lambda: ss.update(action="next"))
-                b2.button("Write report now", on_click=lambda: ss.update(action="write"))
-    if st.button("Start a new topic", key="new_topic_running"):
-        reset()
-        st.rerun()
-
-# ---------------- results ----------------
-rep = ss.report
-if rep:
-    s = rep.stats
-    c = st.columns(6)
-    c[0].metric("Rounds", s.get("rounds"))
-    c[1].metric("Sources collected", s.get("sources_collected"))
-    c[2].metric("Sources cited", s.get("sources_cited", 0))
-    c[3].metric("Sentences kept", s.get("sentences_kept", 0))
-    c[4].metric("Removed in verification", s.get("sentences_removed", 0))
-    c[5].metric("Tokens", f"{s.get('tokens_used', 0):,}")
-    st.caption(f"Stop condition: {s.get('stop_reason')} · {s.get('failed_searches')} failed searches · "
-               f"{s.get('sentences_unverified_removed', 0)} unverifiable sentences removed · {s.get('seconds')}s")
-    m = s.get("models")
-    if m:
-        c = st.columns(5)
-        c[0].metric("Strong tokens", f"{m['usage'].get('strong', {}).get('tokens', 0):,}")
-        c[1].metric("Fast tokens", f"{m['usage'].get('fast', {}).get('tokens', 0):,}")
-        c[2].metric("Model or key switches", m["switches"])
-        c[3].metric("Estimated cost", f"${m.get('cost_usd', 0):.4f}")
-        c[4].metric("Tavily searches", tavily_searches(rep.state))
-        st.caption("Models used: " + ", ".join(f"{role} = {label}" for role, label in m["active"].items())
-                   + " · " + " · ".join(f"{role}: {role_tokens(u)}" for role, u in m["usage"].items())
-                   + ("" if m.get("priced") else " · no prices set, so the cost is 0"))
-
-    t_report, t_evidence, t_sources, t_trace, t_removed = st.tabs(
-        ["Report", "Evidence", "Sources", "Trace", "Removed sentences"])
-    with t_report:
-        st.markdown(no_latex(rep.markdown))
-        d1, d2, d3 = st.columns(3)
-        d1.download_button("Download Markdown", rep.markdown, file_name="apollo_report.md", mime="text/markdown")
-        d3.download_button("Download provenance JSON",
-                           json.dumps(provenance(rep), indent=2, default=str, ensure_ascii=False),
-                           file_name=f"apollo_provenance_{rep.state.run_id}.json", mime="application/json")
-        try:
-            from apollo.export import markdown_to_pdf
-            d2.download_button("Download PDF", markdown_to_pdf(rep.markdown), file_name="apollo_report.pdf",
-                               mime="application/pdf")
-        except Exception as e:
-            d2.caption(f"PDF export unavailable: {e}")
-    with t_evidence:
-        st.caption("Open any sentence to see the exact passages it cites. Words the sentence shares with a "
-                   "passage are in bold.")
-        sentences = rep.sentences
-        sections = list(dict.fromkeys(x["section"] for x in sentences))
-        f1, f2 = st.columns([3, 1])
-        pick = f1.selectbox("Section", ["All sections"] + sections, key="ev_section")
-        show_removed = f2.toggle("Show removed sentences", key="ev_removed")
-        shown = [x for x in sentences if pick in ("All sections", x["section"])]
-        for x in (x for x in shown if x["verdict"] == "kept"):
-            plain = plain_sentence(x["text_with_refs"])
-            with st.expander(no_latex(f"{x['section']}: {plain[:160]}{'…' if len(plain) > 160 else ''}")):
-                st.markdown(no_latex(x["text_with_refs"]))
-                if not x["evidence"]:
-                    st.caption(f"No cited passage: this sentence {x['reason']}.")
-                for ev in x["evidence"]:
-                    ref = f"[{ev['ref_number']}] " if ev["ref_number"] else ""
-                    st.markdown(f"**{ref}[{ev['title'] or ev['url']}]({ev['url']})** · {ev['domain']} · "
-                                f"{ev['published'] or 'date unknown'}")
-                    st.markdown("> " + no_latex(highlight(ev["passage"], x["text_with_refs"])))
-        if show_removed:
-            st.subheader("Removed sentences")
-            removed_rows = [x for x in shown if x["verdict"] == "removed"]
-            for x in removed_rows:
-                st.markdown(no_latex(f"- **{x['section']}**: {plain_sentence(x['text_with_refs'])}  \n  "
-                                     f"*Removed: {x['reason']}*"))
-            if not removed_rows:
-                st.write("No sentences were removed in this section.")
-    with t_sources:
-        src = pd.DataFrame(rep.sources)
-        for col in src.columns:   # e.g. ref numbers or years mixed with "": one text column so Arrow can show it
-            if src[col].dropna().map(type).nunique() > 1:
-                src[col] = src[col].fillna("").astype(str)
-        st.dataframe(src, width="stretch", hide_index=True,
-                     column_config={"url": st.column_config.LinkColumn("URL"),
-                                    "ref": st.column_config.TextColumn("Ref #")})
-    with t_trace:
-        g_col, r_col = st.columns([2, 3])
-        show_graph(g_col.empty(), rep.state.plan)
-        gate = {g["round"]: g for g in ss.gate_log}
-        r_col.dataframe(pd.DataFrame([{
-            "round": r["round"],
-            "queries sent": ", ".join(f"{src} {n}" for src, n in r["queries"].items()) or "0",
-            "new domains": r["new_domains"],
-            "gaps by type": ", ".join(f"{t} {n}" for t, n in r["gaps"].items()) or "none",
-            "decision": r["decision"], "reason": r["reason"],
-            **({"your choice": (f"{gate[r['round']]['choice']} ({gate[r['round']]['approved']} approved, "
-                                f"{gate[r['round']]['edited']} edited)" if r["round"] in gate else "")}
-               if gate else {})} for r in rep.state.round_log]), width="stretch", hide_index=True)
-        st.dataframe(pd.DataFrame([{"t": e["t"], "actor": ACTORS.get(e.get("actor"), ACTORS["system"])[0],
-                                    "kind": e["kind"], "text": e["text"]} for e in ss.events]),
-                     width="stretch", hide_index=True)
-        for log in rep.state.review_log:
-            with st.expander(f"Hermes review, round {log['round']}, section {log['section']}"):
-                st.json(log["review"])
-    with t_removed:
-        if rep.removed:
-            st.dataframe(pd.DataFrame(rep.removed), width="stretch", hide_index=True)
-        else:
-            st.write("Verification removed nothing.")
-
-    if st.button("Start a new topic"):
-        reset()
-        st.rerun()
+        st.caption(f"Newest benchmark: {bench_dir}")
+        st.markdown(no_latex((bench_dir / "benchmark.md").read_text(encoding="utf-8")))
 
 show_models()

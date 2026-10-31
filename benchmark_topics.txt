@@ -1,7 +1,6 @@
 # One topic per line. Lines starting with # are ignored.
-# Mix of policy, technology, health and economics topics so the benchmark is not tuned to one kind of question.
-Impact of AI on Indian agriculture
-Electric vehicle adoption in India
-Microplastics in drinking water
-Groundwater depletion in North India
-Rooftop solar adoption in Indian cities
+# The three demo topics (docs/demo_topics.md). The earlier, broader set (agriculture, EVs, microplastics,
+# groundwater, rooftop solar) is in git history (commit 33fe5af).
+India's semiconductor manufacturing push: fabs, subsidies and challenges
+Global generative AI market size forecasts for 2030
+Forecasts of India's AI market size by 2030
