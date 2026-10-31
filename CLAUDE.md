@@ -47,5 +47,7 @@ unsupported sentences; an assembler builds the final report.
   LLM output is never used directly as a URL to fetch.
 - `python -m tests.run_all` must pass after every change. Extend it for every new feature.
 - Small, focused diffs. Touch only the files the task needs.
+- Git: one person does every prompt. Commit straight to main and never create role branches;
+  ignore the "Branch:" line in prompts/.
 - After each task, report: files changed; the change explained in plain words for a
   first-year student; how to test it; known limitations.
