@@ -51,6 +51,33 @@ def probe(llm: LLM, c) -> dict:
             "secs": round(time.time() - start, 1), "err": last_err}
 
 
+def probe_all(llm: LLM) -> list[tuple[str, object, dict]]:
+    """(role, candidate, probe result) for every candidate of every role; each candidate is probed once."""
+    seen, out = {}, []
+    for role in ("strong", "fast"):
+        for c in llm.candidates(role):
+            if c not in seen:
+                seen[c] = probe(llm, c)
+            out.append((role, c, seen[c]))
+    return out
+
+
+def probe_tavily() -> tuple[list[tuple[int, bool, str]], str]:
+    """([(key number, works, error)], problem with the key setting or ""); one 1-result search per key."""
+    try:
+        keys = search.tavily_keys()
+    except search.SearchError as e:
+        return [], str(e)
+    out = []
+    for i, key in enumerate(keys, 1):
+        try:
+            search._tavily_once(key, "test", Limits(results_per_query=1), "general")
+            out.append((i, True, ""))
+        except Exception as e:  # report and continue with the next key
+            out.append((i, False, str(e)[:90]))
+    return out, ""
+
+
 def main() -> int:
     try:
         llm = LLM(Budget(10**9))
@@ -61,31 +88,20 @@ def main() -> int:
         print("WARNING:", w)
 
     print(f"\n{'role':<11}{'candidate':<52}{'result':<8}{'json':<6}{'no-think':<10}{'thinks':<8}{'secs':<6}error")
-    seen, ok_roles = {}, set()
-    for role in ("strong", "fast"):
-        for c in llm.candidates(role):
-            if c not in seen:
-                seen[c] = probe(llm, c)
-            r = seen[c]
-            if r["ok"]:
-                ok_roles.add(role)
-            print(f"{role:<11}{c.label[:50]:<52}{'OK' if r['ok'] else 'FAILED':<8}{r['json']:<6}"
-                  f"{r['switch']:<10}{r['thinking']:<8}{r['secs']:<6}{r['err']}")
+    ok_roles = set()
+    for role, c, r in probe_all(llm):
+        if r["ok"]:
+            ok_roles.add(role)
+        print(f"{role:<11}{c.label[:50]:<52}{'OK' if r['ok'] else 'FAILED':<8}{r['json']:<6}"
+              f"{r['switch']:<10}{r['thinking']:<8}{r['secs']:<6}{r['err']}")
 
     print()
-    tavily_ok = False
-    try:
-        keys = search.tavily_keys()
-    except search.SearchError as e:
-        keys = []
-        print("Tavily: FAILED:", e)
-    for i, key in enumerate(keys, 1):
-        try:
-            search._tavily_once(key, "test", Limits(results_per_query=1), "general")
-            print(f"Tavily key #{i}: OK")
-            tavily_ok = True
-        except Exception as e:  # report and continue with the next key
-            print(f"Tavily key #{i}: FAILED: {str(e)[:90]}")
+    keys, problem = probe_tavily()
+    if problem:
+        print("Tavily: FAILED:", problem)
+    for i, ok, err in keys:
+        print(f"Tavily key #{i}: OK" if ok else f"Tavily key #{i}: FAILED: {err}")
+    tavily_ok = any(ok for _, ok, _ in keys)
 
     print()
     problems = [name for name, ok in (("strong model", "strong" in ok_roles), ("fast model", "fast" in ok_roles),

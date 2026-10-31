@@ -3,7 +3,7 @@ import sys
 
 from tests import (test_app, test_benchmark, test_cost_meter, test_criteria, test_edge_cases, test_evidence,
                    test_failure_and_conflicts, test_hardening, test_list_models, test_llm_failover, test_offline,
-                   test_provenance, test_run_topic, test_scout, test_sources, test_steps, test_verify)
+                   test_preflight, test_provenance, test_run_topic, test_scout, test_sources, test_steps, test_verify)
 
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
@@ -41,3 +41,5 @@ if __name__ == "__main__":
     test_app.main()
     print()
     test_edge_cases.main()
+    print()
+    test_preflight.main()
