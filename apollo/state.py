@@ -135,6 +135,10 @@ class RunState:
     search_log: list[dict] = field(default_factory=list)   # every search call: round, sq, query, source, urls, status
     round_log: list[dict] = field(default_factory=list)    # per round: queries per source, new sources/domains,
                                                            # gaps, Apollo's decision
+    # step-by-step runs (Apollo.start_run / run_round / approve_gaps / finish)
+    next_jobs: list = field(default_factory=list)          # (SubQ, query) pairs the next round will search
+    pending_gaps: list[dict] = field(default_factory=list) # last round's gaps: route's gap + "id" and proposed "query"
+    done: bool = False                                     # True once the research loop should stop and write
 
     @property
     def elapsed(self) -> float:

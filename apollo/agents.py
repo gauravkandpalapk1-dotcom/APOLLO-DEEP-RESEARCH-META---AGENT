@@ -488,24 +488,33 @@ def _close(sq: SubQ, state: RunState, reason: str):
     sq.status_reason = reason
 
 
-def follow_up_jobs(state: RunState, gaps: list[dict]) -> list[tuple[SubQ, str]]:
-    """One targeted query per sub-question, chosen by gap type."""
+GAP_PRIORITY = {"contradiction": 0, "coverage": 1, "criteria": 2, "stale": 3}
+
+
+def gap_query(state: RunState, g: dict) -> str:
+    """The follow-up query a gap would get, chosen by gap type. No side effects, so it can be shown before approval."""
     year = datetime.now().year
+    sq = g["sq"]
+    if g["type"] == "contradiction":
+        query = g["con"].get("follow_up_query") or f"{sq.query} official figures"
+    elif g["type"] == "stale":
+        query = f"{sq.query} {year}"
+    else:
+        query = sq.follow_up or f"{sq.query} data report"
+    if query in sq.queries:
+        query = f"{query} {year} latest"
+    return query
+
+
+def follow_up_jobs(state: RunState, gaps: list[dict]) -> list[tuple[SubQ, str]]:
+    """One targeted query per sub-question, from its highest-priority gap."""
     jobs, done = [], set()
-    priority = {"contradiction": 0, "coverage": 1, "criteria": 2, "stale": 3}
-    for g in sorted(gaps, key=lambda g: priority[g["type"]]):
+    for g in sorted(gaps, key=lambda g: GAP_PRIORITY[g["type"]]):
         sq = g["sq"]
         if sq.id in done:
             continue
         if g["type"] == "contradiction":
             g["con"]["chased"] = True
-            query = g["con"].get("follow_up_query") or f"{sq.query} official figures"
-        elif g["type"] == "stale":
-            query = f"{sq.query} {year}"
-        else:
-            query = sq.follow_up or f"{sq.query} data report"
-        if query in sq.queries:
-            query = f"{query} {year} latest"
-        jobs.append((sq, query))
+        jobs.append((sq, gap_query(state, g)))
         done.add(sq.id)
     return jobs

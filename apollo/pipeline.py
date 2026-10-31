@@ -7,7 +7,8 @@ import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 
-from .agents import apollo_plan, athena, close_open, follow_up_jobs, hermes, route, status_summary
+from .agents import (GAP_PRIORITY, apollo_plan, athena, close_open, follow_up_jobs, gap_query, hermes, route,
+                     status_summary)
 from .config import Limits
 from .llm import LLM, AllProvidersFailed, Budget, BudgetExceeded
 from .state import Plan, RunState
@@ -61,50 +62,99 @@ class Apollo:
                                  "error": ev.text if failed else ""})
 
     def research(self, plan: Plan):
-        """Generator of Events. The last event has kind 'done' and data={'report': Report}."""
+        """Generator of Events. The last event has kind 'done' and data={'report': Report}.
+        The whole run in one go: every gap Apollo finds is approved and followed up."""
+        state = self.start_run(plan)
+        while not state.done:
+            yield from self.run_round(state)
+            if not state.done:
+                self.approve_gaps(state, [g["id"] for g in state.pending_gaps], {})
+        yield from self.finish(state)
+
+    # ---------- the same run, step by step (for a human gap gate in the UI) ----------
+    def start_run(self, plan: Plan) -> RunState:
+        """A fresh run: no rounds yet, every planned sub-question queued for the first search."""
         state = RunState(plan=plan, limits=self.limits)
-        yield state.event("plan", f"Plan: {len(plan.sections)} sections, {len(plan.subqs)} sub-questions",
-                          {"sections": [{"title": s.title, "questions": [plan.subqs[q].question for q in s.subq_ids]}
-                                        for s in plan.sections]}, actor="apollo")
-        for w in plan.warnings:
-            yield state.event("warning", w, actor="apollo")
+        state.next_jobs = [(sq, sq.query) for sq in plan.subqs.values()]
+        return state
 
-        jobs = [(sq, sq.query) for sq in plan.subqs.values()]
-        while True:
-            state.round += 1
-            yield state.event("round", f"Round {state.round}: Athena runs {len(jobs)} quer{'y' if len(jobs) == 1 else 'ies'}",
-                              actor="apollo")
-            for ev in self._as("athena", athena(state, jobs)):
-                self._log_search(state, ev)
-                yield ev
-            yield from self._notices(state)
-            try:
-                yield from self._as("hermes", hermes(state, self.llm))
-            except BudgetExceeded as e:
-                yield state.event("error", str(e), actor="hermes")
-            yield from self._notices(state)
-            decision, reason, gaps = route(state, self.budget)
-            for g in gaps:
-                yield state.event("gap", f"{g['sq'].id} {g['type']} gap: {g['detail']}",
-                                  {"sq": g["sq"].id, "type": g["type"], "detail": g["detail"]}, actor="apollo")
-            yield state.event("decision", f"Apollo: {'search again' if decision == 'search' else 'stop'} ({reason})",
-                              {"decision": decision, "reason": reason, "tokens": self.budget.used}, actor="apollo")
-            state.round_log.append({
-                "round": state.round,
-                "queries": dict(Counter(s["source"] for s in state.search_log if s["round"] == state.round)),
-                "new_sources": state.new_sources_this_round, "new_domains": state.new_domains_this_round,
-                "gaps": dict(Counter(g["type"] for g in gaps)),
-                "gap_details": [{"sq": g["sq"].id, "type": g["type"], "detail": g["detail"]} for g in gaps],
-                "decision": decision, "reason": reason})
-            if decision == "write":
-                state.stop_reason = reason
-                break
-            jobs = follow_up_jobs(state, gaps)
-            if not jobs:  # nothing left to search for: never loop without work
-                close_open(state, "no follow-up queries left")
-                state.stop_reason = f"no follow-up queries left: {status_summary(plan)}"
-                break
+    def run_round(self, state: RunState):
+        """One round: search, review, route. Yields Events. Afterwards state.pending_gaps holds this round's gaps,
+        each with an "id" and the proposed follow-up "query", and state.done is True if Apollo decided to write.
+        The first call also announces the plan."""
+        if state.done:
+            return
+        plan = state.plan
+        if state.round == 0:
+            yield state.event("plan", f"Plan: {len(plan.sections)} sections, {len(plan.subqs)} sub-questions",
+                              {"sections": [{"title": s.title, "questions": [plan.subqs[q].question for q in s.subq_ids]}
+                                            for s in plan.sections]}, actor="apollo")
+            for w in plan.warnings:
+                yield state.event("warning", w, actor="apollo")
 
+        jobs = state.next_jobs
+        state.round += 1
+        yield state.event("round", f"Round {state.round}: Athena runs {len(jobs)} quer{'y' if len(jobs) == 1 else 'ies'}",
+                          actor="apollo")
+        for ev in self._as("athena", athena(state, jobs)):
+            self._log_search(state, ev)
+            yield ev
+        yield from self._notices(state)
+        try:
+            yield from self._as("hermes", hermes(state, self.llm))
+        except BudgetExceeded as e:
+            yield state.event("error", str(e), actor="hermes")
+        yield from self._notices(state)
+        decision, reason, gaps = route(state, self.budget)
+        for i, g in enumerate(gaps):
+            g["id"], g["query"] = f"g{state.round}-{i + 1}", gap_query(state, g)
+            yield state.event("gap", f"{g['sq'].id} {g['type']} gap: {g['detail']}",
+                              {"id": g["id"], "sq": g["sq"].id, "type": g["type"], "detail": g["detail"],
+                               "query": g["query"]}, actor="apollo")
+        yield state.event("decision", f"Apollo: {'search again' if decision == 'search' else 'stop'} ({reason})",
+                          {"decision": decision, "reason": reason, "tokens": self.budget.used}, actor="apollo")
+        state.round_log.append({
+            "round": state.round,
+            "queries": dict(Counter(s["source"] for s in state.search_log if s["round"] == state.round)),
+            "new_sources": state.new_sources_this_round, "new_domains": state.new_domains_this_round,
+            "gaps": dict(Counter(g["type"] for g in gaps)),
+            "gap_details": [{"id": g["id"], "sq": g["sq"].id, "type": g["type"], "detail": g["detail"],
+                             "query": g["query"]} for g in gaps],
+            "decision": decision, "reason": reason})
+        state.pending_gaps, state.next_jobs = gaps, []
+        if decision == "write":
+            state.done, state.stop_reason = True, reason
+
+    def approve_gaps(self, state: RunState, approved_ids: list[str], edited_queries: dict[str, str] | None = None,
+                     write_now: bool = False) -> list:
+        """The gap gate. Follow up only the approved gaps in the next round, using an edited query where one is given
+        (gap id -> query); returns those (SubQ, query) jobs. write_now stops searching and goes to writing."""
+        if state.done:
+            return []
+        if write_now:
+            close_open(state, "user chose to write")
+            state.done, state.next_jobs = True, []
+            state.stop_reason = f"user chose to write: {status_summary(state.plan)}"
+            return []
+        wanted = set(approved_ids)
+        approved = [g for g in state.pending_gaps if g["id"] in wanted]
+        jobs = follow_up_jobs(state, approved)
+        edits = {}                                  # one query per sub-question: the highest-priority edit wins
+        for g in sorted(approved, key=lambda g: GAP_PRIORITY[g["type"]], reverse=True):
+            query = str((edited_queries or {}).get(g["id"]) or "").strip()[:200]
+            if query:
+                edits[g["sq"].id] = query
+        jobs = [(sq, edits.get(sq.id, query)) for sq, query in jobs]
+        if not jobs:  # nothing left to search for: never loop without work
+            close_open(state, "no follow-up queries left")
+            state.done = True
+            state.stop_reason = f"no follow-up queries left: {status_summary(state.plan)}"
+        state.next_jobs = jobs
+        return jobs
+
+    def finish(self, state: RunState):
+        """Write, verify and assemble the report. Yields Events ending with "done" (data={'report': Report})."""
+        plan = state.plan
         yield state.event("write", f"Writing {len(plan.sections)} sections from their own evidence", actor="writer")
         sentences = []
         try:
