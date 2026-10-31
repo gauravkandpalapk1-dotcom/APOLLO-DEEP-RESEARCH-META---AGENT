@@ -1,9 +1,9 @@
 """Run every offline test. Run: python -m tests.run_all"""
 import sys
 
-from tests import (test_app, test_benchmark, test_criteria, test_evidence, test_failure_and_conflicts, test_hardening,
-                   test_list_models, test_llm_failover, test_offline, test_provenance, test_run_topic, test_scout,
-                   test_sources, test_steps, test_verify)
+from tests import (test_app, test_benchmark, test_criteria, test_edge_cases, test_evidence, test_failure_and_conflicts,
+                   test_hardening, test_list_models, test_llm_failover, test_offline, test_provenance, test_run_topic,
+                   test_scout, test_sources, test_steps, test_verify)
 
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
@@ -37,3 +37,5 @@ if __name__ == "__main__":
     test_list_models.main()
     print()
     test_app.main()
+    print()
+    test_edge_cases.main()

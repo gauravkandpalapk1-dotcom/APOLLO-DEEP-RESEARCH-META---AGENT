@@ -134,7 +134,8 @@ def verify(text: str, allowed: dict[str, Chunk], llm: LLM,
             s = re.sub(r"\[\s*,?\s*\]", "", s).replace(" .", ".").strip()
             good = [i for i in ids if i in allowed]
             if not good:
-                row.append([s, "keep", [], NO_CLAIM] if is_limitation(s) else [s, "drop", [], "no valid citation"])
+                why = "no valid citation" + (f" (cites {', '.join(bad)}, not in this section's evidence)" if bad else "")
+                row.append([s, "keep", [], NO_CLAIM] if is_limitation(s) else [s, "drop", [], why])
                 continue
             entry = [s, "check", good, ""]
             row.append(entry)
