@@ -4,7 +4,7 @@ Run: python -m tests.test_sources"""
 import sys
 
 from apollo import agents
-from apollo.agents import REVIEW_SYSTEM, numeric_contradictions, route, validate_plan
+from apollo.agents import REVIEW_SYSTEM, numeric_contradictions, plan_from_rows, route, validate_plan
 from apollo.config import CHUNK_DATA_RULE, Limits
 from apollo.pipeline import Apollo
 from apollo.search import Doc, classify_source
@@ -99,11 +99,24 @@ def test_every_prompt_with_retrieved_text_has_the_data_rule():
         assert CHUNK_DATA_RULE in system, system
 
 
+def test_edited_plan_keeps_any_source_subset():
+    lim = Limits(enabled_sources=("web", "news", "arxiv"))
+    rows = [{"section": "S1", "question": "Q1?", "sources": "arxiv, edgar"},
+            {"section": "S2", "question": "Q2?", "sources": "ArXiv,news"}, {"section": "S2", "question": "Q3?"}]
+    plan = plan_from_rows("t", rows, lim)
+    assert [sq.source_types for sq in plan.subqs.values()] == [["arxiv"], ["arxiv", "news"], ["web"]]
+    assert plan.warnings == ["'Q1?': edgar not enabled; searching arxiv instead"], plan.warnings
+    raw = {"sections": [{"title": f"S{i}", "sub_questions": [{"question": f"Q{i}?", "source_types": ["arxiv"]}]}
+                        for i in (1, 2)]}
+    assert validate_plan("t", raw, lim).subqs["q1"].source_types == ["web", "arxiv"], "the planner keeps web"
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for t in (test_domain_and_classify_source, test_same_domain_does_not_cover, test_contradiction_needs_two_domains,
-              test_search_cap_stops_the_run, test_no_new_domains_stop, test_every_prompt_with_retrieved_text_has_the_data_rule):
+              test_search_cap_stops_the_run, test_no_new_domains_stop, test_every_prompt_with_retrieved_text_has_the_data_rule,
+              test_edited_plan_keeps_any_source_subset):
         t()
         print("ok  ", t.__name__)
     print("ALL SOURCES TESTS PASSED")

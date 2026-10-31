@@ -1,0 +1,136 @@
+"""Headless tests of the Streamlit UI with the fake LLM and fake search: plan graph, actor-labelled log, gap review
+one round per click, the Trace tab, and a rerun in the middle of a run. Run: python -m tests.test_app"""
+import sys
+from pathlib import Path
+
+from streamlit.testing.v1 import AppTest
+
+from apollo import agents, pipeline
+from tests.test_offline import FakeLLM, fake_search
+
+APP = str(Path(__file__).resolve().parent.parent / "app.py")
+TOPIC = "Impact of AI on Indian agriculture"
+REAL_LLM, REAL_SEARCH = pipeline.LLM, agents.run_search
+
+
+class UIFakeLLM(FakeLLM):
+    warnings = []                                            # the app shows the real LLM's key warnings
+
+
+def _app(review_gaps: bool) -> AppTest:
+    agents.run_search = fake_search
+    pipeline.LLM = lambda budget: UIFakeLLM()
+    at = AppTest.from_file(APP, default_timeout=60).run()
+    at.slider[0].set_value(3)                                    # maximum rounds
+    at.multiselect[0].set_value(["web", "news", "arxiv", "edgar"])
+    [t for t in at.toggle if t.label == "Review gaps between rounds"][0].set_value(review_gaps)
+    at.text_input[0].input(TOPIC).run()
+    _click(at, "Plan research")
+    return at
+
+
+def _click(at: AppTest, label: str):
+    [b for b in at.button if b.label == label][0].click()
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+
+
+def _graphs(at: AppTest) -> list[str]:
+    return [g.proto.spec for g in at.get("graphviz_chart")]
+
+
+def _markdown(at: AppTest) -> str:
+    return "\n".join(m.value for m in at.markdown)
+
+
+def test_plan_review_shows_graph_and_editor():
+    at = _app(review_gaps=False)
+    graphs = _graphs(at)
+    assert len(graphs) == 1 and "digraph plan" in graphs[0] and "topic -> s1" in graphs[0], graphs
+    assert graphs[0].count('fillcolor="#d9d9d9"') == 4, "every sub-question starts open (grey)"
+    assert any("open" in c.value and "unfillable" in c.value for c in at.caption), "legend shown"
+    assert at.session_state["run"] is None and at.session_state["phase"] is None
+
+
+def test_plan_editor_accepts_any_source_subset():
+    at = _app(review_gaps=True)
+    at.session_state["plan_editor"] = {"edited_rows": {0: {"sources": ["arxiv", "edgar"]}}, "added_rows": [],
+                                       "deleted_rows": []}
+    at.run()
+    _click(at, "Approve plan and start research")
+    state = at.session_state["run"]
+    assert state.plan.subqs["q1"].source_types == ["arxiv", "edgar"], state.plan.subqs["q1"].source_types
+    assert {s["source"] for s in state.search_log if s["sq"] == "q1"} == {"arxiv", "edgar"}, "no web for q1"
+
+
+def test_full_run_with_the_toggle_off():
+    at = _app(review_gaps=False)
+    _click(at, "Approve plan and start research")
+    rep = at.session_state["report"]
+    assert rep is not None and at.session_state["phase"] == "done" and rep.state.round >= 2
+    actors = {e["actor"] for e in at.session_state["events"]}
+    assert {"apollo", "athena", "hermes", "writer"} <= actors, actors
+    final = _graphs(at)[0]                                      # Trace tab graph: final statuses
+    assert 'fillcolor="#9bd89b"' in final and 'fillcolor="#f08c8c"' in final, "covered green, unfillable red"
+    trace = [d.value for d in at.dataframe]
+    rounds = next(df for df in trace if "gaps by type" in df.columns)
+    assert list(rounds["round"]) == list(range(1, rep.state.round + 1))
+    assert {"queries sent", "new domains", "decision", "reason"} <= set(rounds.columns)
+    assert "your choice" not in rounds.columns, "no gap review in this run"
+    events = next(df for df in trace if "actor" in df.columns)
+    assert {"Apollo", "Athena", "Hermes", "Writer"} <= set(events["actor"])
+
+
+def test_gap_review_one_round_per_click():
+    at = _app(review_gaps=True)
+    _click(at, "Approve plan and start research")
+    assert at.session_state["phase"] == "gaps" and at.session_state["run"].round == 1, "stops after one round"
+    assert len(_graphs(at)) == 1 and not any(b.label == "Approve plan and start research" for b in at.button),         "the plan editor is gone once the run starts"
+    assert at.session_state["report"] is None
+    md = _markdown(at)
+    assert ":blue[**Apollo**]" in md and ":green[**Athena**]" in md and ":orange[**Hermes**]" in md
+    gaps = at.session_state["gap_rows"]
+    assert gaps and {"approve", "id", "type", "sub-question", "detail", "query"} <= set(gaps[0])
+    first = gaps[0]
+    at.session_state["gap_editor_1"] = {"edited_rows": {0: {"query": "my own query"}}, "added_rows": [],
+                                         "deleted_rows": []}
+    _click(at, "Run next round")
+    state = at.session_state["run"]
+    assert state.round == 2 and at.session_state["gate_log"][0]["edited"] == 1
+    assert any(s["round"] == 2 and s["query"] == "my own query" for s in state.search_log), \
+        f"edited query for {first['id']} was searched"
+    if at.session_state["phase"] == "gaps":
+        _click(at, "Write report now")
+    rep = at.session_state["report"]
+    assert rep is not None and at.session_state["phase"] == "done"
+    rounds = next(d.value for d in at.dataframe if "gaps by type" in d.value.columns)
+    assert "your choice" in rounds.columns and "run next round" in rounds["your choice"].iloc[0]
+
+
+def test_rerun_mid_round_does_not_crash():
+    at = _app(review_gaps=True)
+    _click(at, "Approve plan and start research")
+    at.session_state["phase"] = "round"                          # as if the page reran while a round was running
+    at.run()
+    assert not at.exception and any("interrupted" in w.value for w in at.warning)
+    _click(at, "Write report from what was found")
+    assert at.session_state["report"] is not None and at.session_state["phase"] == "done"
+    assert at.session_state["report"].state.stop_reason.startswith("user chose to write")
+
+
+def main():
+    if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        for t in (test_plan_review_shows_graph_and_editor, test_plan_editor_accepts_any_source_subset,
+                  test_full_run_with_the_toggle_off,
+                  test_gap_review_one_round_per_click, test_rerun_mid_round_does_not_crash):
+            t()
+            print("ok  ", t.__name__)
+    finally:
+        pipeline.LLM, agents.run_search = REAL_LLM, REAL_SEARCH
+    print("ALL APP TESTS PASSED")
+
+
+if __name__ == "__main__":
+    main()

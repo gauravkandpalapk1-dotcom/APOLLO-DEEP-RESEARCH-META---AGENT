@@ -1,5 +1,6 @@
 """Streamlit UI. Run: streamlit run app.py"""
 import json
+import time
 
 import pandas as pd
 import streamlit as st
@@ -13,9 +14,16 @@ st.set_page_config(page_title="Apollo research", page_icon="🔭", layout="wide"
 
 ICONS = {"plan": "🗺️", "round": "🔁", "search": "🔎", "search_fail": "⚠️", "review": "🧐", "gap": "🕳️",
          "decision": "🧭", "write": "✍️", "verify": "✅", "error": "❌", "done": "📄"}
+ACTORS = {"apollo": ("Apollo", "blue"), "athena": ("Athena", "green"), "hermes": ("Hermes", "orange"),
+          "writer": ("Writer", "violet"), "oracle": ("Oracle", "red"), "system": ("System", "gray")}
+STATUS_FILL = {"open": "#d9d9d9", "covered": "#9bd89b", "partial": "#f6c76b", "unfillable": "#f08c8c"}
+LEGEND = "Sub-questions: :gray[■] open · :green[■] covered · :orange[■] partial · :red[■] unfillable"
 
 ss = st.session_state
-for k, v in {"plan": None, "rows": None, "events": [], "report": None}.items():
+# phase of the current run: None, "round" (searching), "gaps" (waiting for the gap review), "writing", "done".
+# Finding "round" or "writing" at the start of a script run means the last one was interrupted by a rerun.
+for k, v in {"plan": None, "rows": None, "events": [], "report": None, "run": None, "phase": None,
+             "action": None, "gap_rows": [], "gate_log": [], "paused_at": None}.items():
     ss.setdefault(k, v)
 
 # ---------------- settings ----------------
@@ -27,11 +35,111 @@ with st.sidebar:
     sources = st.multiselect("Source types", SOURCE_TYPES, default=["web", "news", "arxiv"],
                              help="edgar needs SEC_USER_AGENT in .env and only helps for US-listed companies")
     review_plan = st.checkbox("Let me review the plan before searching", value=True)
+    review_gaps = st.toggle("Review gaps between rounds", value=False,
+                            help="Pause after each round to choose which gaps to follow up and edit their queries.")
 
 
 def limits() -> Limits:
     return Limits(max_rounds=max_rounds, max_seconds=minutes * 60, token_budget=int(budget),
                   enabled_sources=tuple(sources or ["web"]))
+
+
+def reset():
+    ss.update(plan=None, rows=None, events=[], report=None, run=None, phase=None, action=None, gap_rows=[],
+              gate_log=[], paused_at=None)
+
+
+# ---------------- plan graph ----------------
+def _dot_label(text: str, width: int = 34, limit: int = 110) -> str:
+    text = text if len(text) <= limit else text[:limit - 1] + "…"
+    lines, line = [], ""
+    for word in text.split():
+        if line and len(line) + len(word) + 1 > width:
+            lines.append(line)
+            line = word
+        else:
+            line = f"{line} {word}".strip()
+    lines.append(line)
+    return "\\n".join(x.replace("\\", "\\\\").replace('"', '\\"') for x in lines)
+
+
+def plan_dot(plan) -> str:
+    """Topic -> sections -> sub-questions as DOT text, each sub-question filled by its status."""
+    out = ["digraph plan {", "rankdir=LR;",
+           'node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, color="#888888"];',
+           f'topic [label="{_dot_label(plan.topic, 26)}", fillcolor="#cfe2ff"];']
+    for s in plan.sections:
+        out += [f'{s.id} [label="{_dot_label(s.title, 26)}", fillcolor="#ffffff"];', f"topic -> {s.id};"]
+        for q in s.subq_ids:
+            sq = plan.subqs[q]
+            out += [f'{q} [label="{q}: {_dot_label(sq.question)}", tooltip="{sq.status}", '
+                    f'fillcolor="{STATUS_FILL.get(sq.status, STATUS_FILL["open"])}"];', f"{s.id} -> {q};"]
+    return "\n".join(out + ["}"])
+
+
+def show_graph(slot, plan):
+    with slot.container():
+        st.graphviz_chart(plan_dot(plan), width="stretch")
+        st.caption(LEGEND)
+
+
+# ---------------- live log ----------------
+def log_line(e: dict):
+    name, colour = ACTORS.get(e.get("actor"), ACTORS["system"])
+    text = e["text"].replace("$", "\\$")                     # "$4.2 billion" is not LaTeX
+    st.markdown(f":{colour}[**{name}**] {ICONS.get(e['kind'], '•')} `{e['t']:>6}s` {text}")
+
+
+def record(ev, metrics):
+    ss.events.append({"t": ev.t, "actor": ev.actor, "kind": ev.kind, "text": ev.text, "data": ev.data})
+    log_line(ss.events[-1])
+    m_round, m_sources, m_gaps, m_tokens = metrics
+    m_round.metric("Round", ss.run.round)
+    m_sources.metric("Source URLs returned",
+                     len({u for e in ss.events if e["kind"] == "search" for u in (e["data"] or {}).get("urls", [])}))
+    m_gaps.metric("Gaps flagged", sum(e["kind"] == "gap" for e in ss.events))
+    m_tokens.metric("Tokens used", f"{ss.app.budget.used:,}")
+
+
+def run_one_round(app, state, graph_slot, metrics):
+    ss.phase = "round"
+    with st.status(f"Round {state.round + 1}…", expanded=True) as status:
+        for ev in app.run_round(state):
+            record(ev, metrics)
+        status.update(label=f"Round {state.round} done", state="complete", expanded=False)
+    show_graph(graph_slot, state.plan)
+    ss.phase = "gaps"
+    ss.gap_rows = [{"approve": True, "id": g["id"], "type": g["type"],
+                    "sub-question": f"{g['sq'].id}: {g['sq'].question}", "detail": g["detail"], "query": g["query"]}
+                   for g in state.pending_gaps]
+    ss.paused_at = time.time()
+
+
+def write_report(app, state, metrics):
+    ss.phase = "writing"
+    with st.status("Writing the report…", expanded=True) as status:
+        for ev in app.finish(state):
+            if ev.kind == "done":
+                ss.report, ss.phase = ev.data["report"], "done"
+                status.update(label="Report ready", state="complete", expanded=False)
+                break
+            record(ev, metrics)
+
+
+def gap_choices() -> list[dict]:
+    """The gap rows with the user's edits from the gap editor applied."""
+    rows = [dict(r) for r in ss.gap_rows]
+    edits = ss.get(f"gap_editor_{ss.run.round}") or {}
+    for i, change in edits.get("edited_rows", {}).items():
+        rows[int(i)].update(change)
+    return rows
+
+
+def resume_clock(state):
+    """Time spent waiting for the gap review doesn't count against the research time limit."""
+    if ss.paused_at:
+        state.started += time.time() - ss.paused_at
+        ss.paused_at = None
 
 
 # ---------------- topic input ----------------
@@ -42,7 +150,7 @@ st.caption("Give it a topic. Apollo plans the report, Athena searches, Hermes ch
 topic = st.text_input("Research topic", placeholder="Impact of AI on Indian agriculture")
 col_a, col_b = st.columns([1, 5])
 if col_a.button("Plan research", type="primary", disabled=not topic.strip()):
-    ss.update(plan=None, rows=None, events=[], report=None)
+    reset()
     try:
         with st.spinner("Apollo is planning sections and sub-questions…"):
             app = Apollo(limits())
@@ -58,48 +166,101 @@ if col_a.button("Plan research", type="primary", disabled=not topic.strip()):
 
 # ---------------- human-in-the-loop plan review ----------------
 start = False
-if ss.plan and not ss.report:
+if ss.plan and ss.run is None and not ss.report:
     if review_plan:
         st.subheader("Review the plan")
-        st.caption("Edit, add or delete rows. c1 and c2 are the acceptance criteria (leave a cell empty for none). "
-                   "Sources can be any of: " + ", ".join(sources or ["web"]))
-        edited = st.data_editor(pd.DataFrame(ss.rows), num_rows="dynamic", width="stretch",
-                                key="plan_editor")
-        start = st.button("Approve plan and start research", type="primary")
+        editor_col, graph_col = st.columns([3, 2])
+        with editor_col:
+            st.caption("Edit, add or delete rows. c1 and c2 are the acceptance criteria (leave a cell empty for "
+                       "none). Pick any sources for each sub-question; only those enabled in the sidebar are "
+                       "searched (" + ", ".join(sources or ["web"]) + ").")
+            table = pd.DataFrame(ss.rows)
+            table["sources"] = table["sources"].map(lambda s: [t.strip() for t in str(s).split(",") if t.strip()])
+            edited = st.data_editor(table, num_rows="dynamic", width="stretch", key="plan_editor",
+                                    column_config={"sources": st.column_config.MultiselectColumn(
+                                        "sources", options=list(SOURCE_TYPES), default=["web"])})
+            start = st.button("Approve plan and start research", type="primary")
+        edited["sources"] = edited["sources"].map(lambda v: ", ".join(v) if isinstance(v, (list, tuple))
+                                                  else str(v or ""))
+        rows = edited.fillna("").to_dict("records")
+        try:
+            draft = plan_from_rows(ss.plan.topic, rows, limits())
+        except PlanError:
+            draft = ss.plan
+        with graph_col:
+            show_graph(st.empty(), draft)
         if start:
             try:
-                ss.plan = plan_from_rows(ss.plan.topic, edited.fillna("").to_dict("records"), limits())
+                ss.plan = plan_from_rows(ss.plan.topic, rows, limits())
             except PlanError as e:
                 st.error(f"The edited plan isn't usable: {e}")
                 start = False
     else:
         start = True
 
-# ---------------- live run ----------------
+# ---------------- the run: one round per script run when gaps are reviewed ----------------
 if start:
-    app = ss.app
-    app.limits = limits()
-    app.budget.limit = app.limits.token_budget
-    live, side = st.columns([3, 1])
+    ss.app.limits = limits()
+    ss.app.budget.limit = ss.app.limits.token_budget
+    ss.run, ss.events, ss.gate_log, ss.phase = ss.app.start_run(ss.plan), [], [], "start"
+    st.rerun()                                       # redraw without the plan editor before searching starts
+
+if ss.run is not None and not ss.report:
+    app, state = ss.app, ss.run
+    interrupted = ss.phase in ("round", "writing")
+    action, ss.action = ss.action, None
+    live, side = st.columns([3, 2])
     with side:
-        m_round, m_sources, m_gaps, m_tokens = st.empty(), st.empty(), st.empty(), st.empty()
-    n_gaps = 0
+        graph_slot = st.empty()
+        show_graph(graph_slot, state.plan)
+        metrics = (st.empty(), st.empty(), st.empty(), st.empty())
     with live:
-        with st.status("Researching…", expanded=True) as status:
-            for ev in app.research(ss.plan):
-                if ev.kind == "done":
-                    ss.report = ev.data["report"]
-                    status.update(label="Report ready", state="complete", expanded=False)
-                    break
-                ss.events.append({"t": ev.t, "kind": ev.kind, "text": ev.text, "data": ev.data})
-                st.write(f"{ICONS.get(ev.kind, '•')} `{ev.t:>6}s` {ev.text}")
-                if ev.kind == "gap":
-                    n_gaps += 1
-                state_sources = len({u for e in ss.events if e["kind"] == "search" for u in e["data"]["urls"]})
-                m_round.metric("Round", sum(1 for e in ss.events if e["kind"] == "round"))
-                m_sources.metric("Source URLs returned", state_sources)
-                m_gaps.metric("Gaps flagged", n_gaps)
-                m_tokens.metric("Tokens used", f"{app.budget.used:,}")
+        if ss.events:
+            with st.expander(f"Run log so far ({len(ss.events)} events)", expanded=False):
+                for e in ss.events:
+                    log_line(e)
+        if interrupted and action != "write":
+            st.warning("The last step was interrupted (the page reran while Apollo was working). Write the report "
+                       "from what was found so far, or start a new topic.")
+            st.button("Write report from what was found", type="primary",
+                      on_click=lambda: ss.update(action="write"))
+        else:
+            if action == "write":
+                resume_clock(state)
+                ss.gate_log.append({"round": state.round, "approved": 0, "edited": 0,
+                                    "choice": "write after interruption" if interrupted else "write report now"})
+                app.approve_gaps(state, [], write_now=True)
+            elif action == "next":
+                resume_clock(state)
+                rows = gap_choices()
+                approved = [r["id"] for r in rows if r["approve"]]
+                original = {g["id"]: g["query"] for g in state.pending_gaps}
+                edits = {r["id"]: r["query"] for r in rows if str(r["query"]).strip() != original.get(r["id"])}
+                ss.gate_log.append({"round": state.round, "choice": "run next round", "approved": len(approved),
+                                    "edited": len(edits)})
+                app.approve_gaps(state, approved, edits)
+            if ss.phase == "start" or action == "next":
+                while not state.done:
+                    run_one_round(app, state, graph_slot, metrics)
+                    if state.done or review_gaps:
+                        break
+                    app.approve_gaps(state, [g["id"] for g in state.pending_gaps], {})
+            if state.done:
+                write_report(app, state, metrics)
+                st.rerun()
+            elif ss.phase == "gaps":
+                st.subheader(f"Gaps after round {state.round}")
+                st.caption("Untick a gap to skip it; edit a query to search for something else. Apollo follows up "
+                           "at most one gap per sub-question (the most important one).")
+                st.data_editor(pd.DataFrame(ss.gap_rows), key=f"gap_editor_{state.round}", hide_index=True,
+                               width="stretch", disabled=["id", "type", "sub-question", "detail"],
+                               column_config={"approve": st.column_config.CheckboxColumn("follow up")})
+                b1, b2, _ = st.columns([1, 1, 3])
+                b1.button("Run next round", type="primary", on_click=lambda: ss.update(action="next"))
+                b2.button("Write report now", on_click=lambda: ss.update(action="write"))
+    if st.button("Start a new topic", key="new_topic_running"):
+        reset()
+        st.rerun()
 
 # ---------------- results ----------------
 rep = ss.report
@@ -163,13 +324,27 @@ if rep:
                 st.write("No sentences were removed in this section.")
     with t_sources:
         src = pd.DataFrame(rep.sources)
-        if "ref" in src:   # numbers for cited sources, "" for the rest: one text column so Arrow can show it
-            src["ref"] = src["ref"].astype(str)
+        for col in src.columns:   # e.g. ref numbers or years mixed with "": one text column so Arrow can show it
+            if src[col].dropna().map(type).nunique() > 1:
+                src[col] = src[col].fillna("").astype(str)
         st.dataframe(src, width="stretch", hide_index=True,
                      column_config={"url": st.column_config.LinkColumn("URL"),
                                     "ref": st.column_config.TextColumn("Ref #")})
     with t_trace:
-        st.dataframe(pd.DataFrame([{k: e[k] for k in ("t", "kind", "text")} for e in ss.events]),
+        g_col, r_col = st.columns([2, 3])
+        show_graph(g_col.empty(), rep.state.plan)
+        gate = {g["round"]: g for g in ss.gate_log}
+        r_col.dataframe(pd.DataFrame([{
+            "round": r["round"],
+            "queries sent": ", ".join(f"{src} {n}" for src, n in r["queries"].items()) or "0",
+            "new domains": r["new_domains"],
+            "gaps by type": ", ".join(f"{t} {n}" for t, n in r["gaps"].items()) or "none",
+            "decision": r["decision"], "reason": r["reason"],
+            **({"your choice": (f"{gate[r['round']]['choice']} ({gate[r['round']]['approved']} approved, "
+                                f"{gate[r['round']]['edited']} edited)" if r["round"] in gate else "")}
+               if gate else {})} for r in rep.state.round_log]), width="stretch", hide_index=True)
+        st.dataframe(pd.DataFrame([{"t": e["t"], "actor": ACTORS.get(e.get("actor"), ACTORS["system"])[0],
+                                    "kind": e["kind"], "text": e["text"]} for e in ss.events]),
                      width="stretch", hide_index=True)
         for log in rep.state.review_log:
             with st.expander(f"Hermes review, round {log['round']}, section {log['section']}"):
@@ -181,5 +356,5 @@ if rep:
             st.write("Verification removed nothing.")
 
     if st.button("Start a new topic"):
-        ss.update(plan=None, rows=None, events=[], report=None)
+        reset()
         st.rerun()

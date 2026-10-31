@@ -55,9 +55,11 @@ JSON shape:
     raise PlanError(f"Could not get a usable plan: {last_err}")
 
 
-def validate_plan(topic: str, raw: dict, limits: Limits) -> Plan:
+def validate_plan(topic: str, raw: dict, limits: Limits, edited: bool = False) -> Plan:
     """Code-level checks on the LLM's plan: caps, allowed sources, no empty or duplicate questions.
-    Items that are not JSON objects are skipped and recorded in plan.warnings instead of crashing."""
+    Items that are not JSON objects are skipped and recorded in plan.warnings instead of crashing.
+    The planner's sub-questions always search the web when it is enabled; a human-edited plan (edited=True) keeps
+    exactly the sources typed for each sub-question, and any that aren't enabled are named in plan.warnings."""
     if not isinstance(raw, dict) or not isinstance(raw.get("sections"), list):
         raise PlanError("Planner output has no list of sections")
     sections, subqs, seen_q, warnings = [], {}, set(), []
@@ -80,8 +82,14 @@ def validate_plan(topic: str, raw: dict, limits: Limits) -> Plan:
                 continue
             seen_q.add(question.lower())
             st_raw = q_raw.get("source_types")
-            types = [t for t in (st_raw if isinstance(st_raw, list) else []) if t in limits.enabled_sources]
-            if "web" in limits.enabled_sources and "web" not in types:
+            asked = list(dict.fromkeys(st_raw if isinstance(st_raw, list) else []))
+            types = [t for t in asked if t in limits.enabled_sources]
+            if edited:
+                dropped = [t for t in asked if t not in limits.enabled_sources]
+                if dropped:
+                    warnings.append(f"'{question[:60]}': {', '.join(map(str, dropped))} not enabled; "
+                                    f"searching {', '.join(types) or limits.enabled_sources[0]} instead")
+            elif "web" in limits.enabled_sources and "web" not in types:
                 types.insert(0, "web")
             if not types:
                 types = [limits.enabled_sources[0]]
@@ -179,9 +187,9 @@ def plan_from_rows(topic: str, rows: list[dict], limits: Limits) -> Plan:
                 "question": r["question"], "query": r.get("query") or r["question"],
                 "perspective": r.get("perspective"),
                 "acceptance_criteria": [{"id": k, "text": r.get(k)} for k in CRITERIA_COLUMNS],
-                "source_types": [t.strip() for t in str(r.get("sources", "web")).split(",") if t.strip()]})
+                "source_types": [t.strip().lower() for t in str(r.get("sources", "web")).split(",") if t.strip()]})
     raw = {"sections": [{"title": k, "sub_questions": v[:3]} for k, v in grouped.items()]}
-    return validate_plan(topic, raw, limits)
+    return validate_plan(topic, raw, limits, edited=True)
 
 
 # =====================================================================
