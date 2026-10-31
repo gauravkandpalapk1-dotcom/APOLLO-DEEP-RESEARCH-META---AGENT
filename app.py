@@ -7,6 +7,7 @@ import streamlit as st
 
 from apollo.agents import PlanError, plan_from_rows, plan_rows
 from apollo.config import SOURCE_TYPES, Limits
+from apollo.llm import AllProvidersFailed, BudgetExceeded
 from apollo.pipeline import Apollo, provenance
 from apollo.writer import highlight, plain_sentence
 from scripts.handcheck_summary import newest_benchmark
@@ -50,6 +51,23 @@ def limits() -> Limits:
 def reset():
     ss.update(plan=None, rows=None, events=[], report=None, run=None, phase=None, action=None, gap_rows=[],
               gate_log=[], paused_at=None)
+
+
+KEY_HELP = ("Check the *_API_KEYS and STRONG_CHAIN / FAST_CHAIN entries in .env, then run "
+            "`python -m scripts.check_keys` to see which keys and models work.")
+
+
+def problem(e: Exception, step: str) -> str:
+    """What went wrong and how to fix it, in one message and without a stack trace."""
+    detail = (str(e).strip() or type(e).__name__)[:300]
+    if isinstance(e, AllProvidersFailed):
+        return f"No language model answered {step}. {KEY_HELP} Details: {detail}"
+    if isinstance(e, BudgetExceeded):
+        return f"The token budget ran out {step}. Raise **Token budget** in the sidebar and try again."
+    if ".env" in detail:                         # e.g. no usable model: the message already names the variable
+        return f"{detail}"
+    return (f"Something went wrong {step} ({type(e).__name__}: {detail}). Try again; if it keeps happening, "
+            f"press **Start a new topic**.")
 
 
 # ---------------- plan graph ----------------
@@ -113,7 +131,7 @@ def show_models():
     status, searches = models_now()
     with models_slot.container():
         if not status:
-            st.caption("No run yet.")
+            st.caption("No run yet. Plan a topic to see the active models, tokens and estimated cost here.")
             return
         for role in ("strong", "fast"):
             st.markdown(f"**{role.title()}:** `{status['active'].get(role, 'not used yet')}`  \n"
@@ -149,7 +167,7 @@ def record(ev, metrics):
 
 def run_one_round(app, state, graph_slot, metrics):
     ss.phase = "round"
-    with st.status(f"Round {state.round + 1}…", expanded=True) as status:
+    with st.status(f"Round {state.round + 1}: Athena is searching and Hermes is reviewing…", expanded=True) as status:
         for ev in app.run_round(state):
             record(ev, metrics)
         status.update(label=f"Round {state.round} done", state="complete", expanded=False)
@@ -163,7 +181,7 @@ def run_one_round(app, state, graph_slot, metrics):
 
 def write_report(app, state, metrics):
     ss.phase = "writing"
-    with st.status("Writing the report…", expanded=True) as status:
+    with st.status("Writing the sections and verifying every sentence…", expanded=True) as status:
         for ev in app.finish(state):
             if ev.kind == "done":
                 ss.report, ss.phase = ev.data["report"], "done"
@@ -210,8 +228,13 @@ with research_tab:
                 ss.app = app
         except PlanError as e:
             st.error(f"Planning failed: {e}. Try rephrasing the topic.")
-        except RuntimeError as e:
-            st.error(str(e))
+        except Exception as e:                   # no usable model in .env, every model failed, network trouble
+            st.error(problem(e, "while planning"))
+
+    if not ss.plan and ss.run is None and not ss.report:
+        st.info("Type a topic and press **Plan research**. Apollo drafts sections and sub-questions first; with "
+                "*Let me review the plan before searching* ticked in the sidebar, you can edit them before any "
+                "search runs.")
 
     # ---------------- human-in-the-loop plan review ----------------
     start = False
@@ -225,10 +248,17 @@ with research_tab:
                            "searched (" + ", ".join(sources or ["web"]) + ").")
                 table = pd.DataFrame(ss.rows)
                 table["sources"] = table["sources"].map(lambda s: [t.strip() for t in str(s).split(",") if t.strip()])
+                text = st.column_config.TextColumn
                 edited = st.data_editor(table, num_rows="dynamic", width="stretch", key="plan_editor",
-                                        column_config={"sources": st.column_config.MultiselectColumn(
-                                            "sources", options=list(SOURCE_TYPES), default=["web"])})
-                start = st.button("Approve plan and start research", type="primary")
+                                        hide_index=True, column_config={
+                                            "section": text("section", width="small"),
+                                            "perspective": text("perspective", width="small"),
+                                            "question": text("question", width="medium"),
+                                            "c1": text("c1", width="small"), "c2": text("c2", width="small"),
+                                            "query": text("query", width="small"),
+                                            "sources": st.column_config.MultiselectColumn(
+                                                "sources", options=list(SOURCE_TYPES), default=["web"])})
+                start = st.button("Approve plan", type="primary")
             edited["sources"] = edited["sources"].map(lambda v: ", ".join(v) if isinstance(v, (list, tuple))
                                                       else str(v or ""))
             rows = edited.fillna("").to_dict("records")
@@ -269,41 +299,56 @@ with research_tab:
                     for e in ss.events:
                         log_line(e)
             if interrupted and action != "write":
-                st.warning("The last step was interrupted (the page reran while Apollo was working). Write the report "
-                           "from what was found so far, or start a new topic.")
-                st.button("Write report from what was found", type="primary",
-                          on_click=lambda: ss.update(action="write"))
+                st.warning("The last step stopped before it finished (the page reran, or something went wrong). "
+                           "Press **Write report now** to write the report from what was found so far, or "
+                           "**Start a new topic**.")
+                st.button("Write report now", type="primary", on_click=lambda: ss.update(action="write"))
             else:
-                if action == "write":
-                    resume_clock(state)
-                    ss.gate_log.append({"round": state.round, "approved": 0, "edited": 0,
-                                        "choice": "write after interruption" if interrupted else "write report now"})
-                    app.approve_gaps(state, [], write_now=True)
-                elif action == "next":
-                    resume_clock(state)
-                    rows = gap_choices()
-                    approved = [r["id"] for r in rows if r["approve"]]
-                    original = {g["id"]: g["query"] for g in state.pending_gaps}
-                    edits = {r["id"]: r["query"] for r in rows if str(r["query"]).strip() != original.get(r["id"])}
-                    ss.gate_log.append({"round": state.round, "choice": "run next round", "approved": len(approved),
-                                        "edited": len(edits)})
-                    app.approve_gaps(state, approved, edits)
-                if ss.phase == "start" or action == "next":
-                    while not state.done:
-                        run_one_round(app, state, graph_slot, metrics)
-                        if state.done or review_gaps:
-                            break
-                        app.approve_gaps(state, [g["id"] for g in state.pending_gaps], {})
-                if state.done:
-                    write_report(app, state, metrics)
+                failed = False
+                try:
+                    if action == "write":
+                        resume_clock(state)
+                        choice = "write after interruption" if interrupted else "write report now"
+                        ss.gate_log.append({"round": state.round, "approved": 0, "edited": 0, "choice": choice})
+                        app.approve_gaps(state, [], write_now=True)
+                    elif action == "next":
+                        resume_clock(state)
+                        rows = gap_choices()
+                        approved = [r["id"] for r in rows if r["approve"]]
+                        original = {g["id"]: g["query"] for g in state.pending_gaps}
+                        edits = {r["id"]: r["query"] for r in rows if str(r["query"]).strip() != original.get(r["id"])}
+                        ss.gate_log.append({"round": state.round, "choice": "run next round",
+                                            "approved": len(approved), "edited": len(edits)})
+                        app.approve_gaps(state, approved, edits)
+                    if ss.phase == "start" or action == "next":
+                        while not state.done:
+                            run_one_round(app, state, graph_slot, metrics)
+                            if state.done or review_gaps:
+                                break
+                            app.approve_gaps(state, [g["id"] for g in state.pending_gaps], {})
+                    if state.done:
+                        write_report(app, state, metrics)
+                except Exception as e:               # the phase stays "round" / "writing": the next run offers to write
+                    failed = True
+                    st.error(problem(e, "during the run"))
+                    st.button("Write report now", type="primary", key="write_after_error",
+                              on_click=lambda: ss.update(action="write"))
+                if state.done and not failed:
                     st.rerun()
-                elif ss.phase == "gaps":
+                elif ss.phase == "gaps" and not failed:
                     st.subheader(f"Gaps after round {state.round}")
                     st.caption("Untick a gap to skip it; edit a query to search for something else. Apollo follows up "
                                "at most one gap per sub-question (the most important one).")
                     st.data_editor(pd.DataFrame(ss.gap_rows), key=f"gap_editor_{state.round}", hide_index=True,
                                    width="stretch", disabled=["id", "type", "sub-question", "detail"],
-                                   column_config={"approve": st.column_config.CheckboxColumn("follow up")})
+                                   column_config={"approve": st.column_config.CheckboxColumn("follow up",
+                                                                                             width="small"),
+                                                  "id": st.column_config.TextColumn("id", width="small"),
+                                                  "type": st.column_config.TextColumn("type", width="small"),
+                                                  "sub-question": st.column_config.TextColumn("sub-question",
+                                                                                              width="medium"),
+                                                  "detail": st.column_config.TextColumn("detail", width="medium"),
+                                                  "query": st.column_config.TextColumn("query", width="medium")})
                     b1, b2, _ = st.columns([1, 1, 3])
                     b1.button("Run next round", type="primary", on_click=lambda: ss.update(action="next"))
                     b2.button("Write report now", on_click=lambda: ss.update(action="write"))
@@ -349,8 +394,10 @@ with research_tab:
                 from apollo.export import markdown_to_pdf
                 d2.download_button("Download PDF", markdown_to_pdf(rep.markdown), file_name="apollo_report.pdf",
                                    mime="application/pdf")
+            except ImportError:
+                d2.caption("PDF export needs the fpdf2 package: run `pip install fpdf2`. Download Markdown works now.")
             except Exception as e:
-                d2.caption(f"PDF export unavailable: {e}")
+                d2.caption(f"PDF export failed ({type(e).__name__}: {str(e)[:120]}). Use Download Markdown instead.")
         with t_evidence:
             st.caption("Open any sentence to see the exact passages it cites. Words the sentence shares with a "
                        "passage are in bold.")
@@ -360,6 +407,11 @@ with research_tab:
             pick = f1.selectbox("Section", ["All sections"] + sections, key="ev_section")
             show_removed = f2.toggle("Show removed sentences", key="ev_removed")
             shown = [x for x in sentences if pick in ("All sections", x["section"])]
+            if not any(x["verdict"] == "kept" for x in sentences):
+                st.info("No sentence survived verification, so there is nothing to inspect yet. The *Removed "
+                        "sentences* tab shows what was dropped and why.")
+            elif not any(x["verdict"] == "kept" for x in shown):
+                st.caption("No kept sentences in this section. Pick another section or *All sections*.")
             for x in (x for x in shown if x["verdict"] == "kept"):
                 plain = plain_sentence(x["text_with_refs"])
                 with st.expander(no_latex(f"{x['section']}: {plain[:160]}{'…' if len(plain) > 160 else ''}")):
@@ -380,26 +432,33 @@ with research_tab:
                 if not removed_rows:
                     st.write("No sentences were removed in this section.")
         with t_sources:
-            src = pd.DataFrame(rep.sources)
-            for col in src.columns:   # e.g. ref numbers or years mixed with "": one text column so Arrow can show it
-                if src[col].dropna().map(type).nunique() > 1:
-                    src[col] = src[col].fillna("").astype(str)
-            st.dataframe(src, width="stretch", hide_index=True,
-                         column_config={"url": st.column_config.LinkColumn("URL"),
-                                        "ref": st.column_config.TextColumn("Ref #")})
+            if not rep.sources:
+                st.info("No sources were collected: every search failed or returned nothing. The *Trace* tab shows "
+                        "each search; if web or news searches failed, check TAVILY_API_KEYS in .env.")
+            else:
+                src = pd.DataFrame(rep.sources)
+                for col in src.columns:   # e.g. ref numbers or years mixed with "": one text column for Arrow
+                    if src[col].dropna().map(type).nunique() > 1:
+                        src[col] = src[col].fillna("").astype(str)
+                st.dataframe(src, width="stretch", hide_index=True,
+                             column_config={"url": st.column_config.LinkColumn("URL"),
+                                            "ref": st.column_config.TextColumn("Ref #")})
         with t_trace:
             g_col, r_col = st.columns([2, 3])
             show_graph(g_col.empty(), rep.state.plan)
             gate = {g["round"]: g for g in ss.gate_log}
-            r_col.dataframe(pd.DataFrame([{
-                "round": r["round"],
-                "queries sent": ", ".join(f"{src} {n}" for src, n in r["queries"].items()) or "0",
-                "new domains": r["new_domains"],
-                "gaps by type": ", ".join(f"{t} {n}" for t, n in r["gaps"].items()) or "none",
-                "decision": r["decision"], "reason": r["reason"],
-                **({"your choice": (f"{gate[r['round']]['choice']} ({gate[r['round']]['approved']} approved, "
-                                    f"{gate[r['round']]['edited']} edited)" if r["round"] in gate else "")}
-                   if gate else {})} for r in rep.state.round_log]), width="stretch", hide_index=True)
+            if not rep.state.round_log:
+                r_col.info("No research round finished, so there is nothing to trace yet.")
+            else:
+                r_col.dataframe(pd.DataFrame([{
+                    "round": r["round"],
+                    "queries sent": ", ".join(f"{src} {n}" for src, n in r["queries"].items()) or "0",
+                    "new domains": r["new_domains"],
+                    "gaps by type": ", ".join(f"{t} {n}" for t, n in r["gaps"].items()) or "none",
+                    "decision": r["decision"], "reason": r["reason"],
+                    **({"your choice": (f"{gate[r['round']]['choice']} ({gate[r['round']]['approved']} approved, "
+                                        f"{gate[r['round']]['edited']} edited)" if r["round"] in gate else "")}
+                       if gate else {})} for r in rep.state.round_log]), width="stretch", hide_index=True)
             st.dataframe(pd.DataFrame([{"t": e["t"], "actor": ACTORS.get(e.get("actor"), ACTORS["system"])[0],
                                         "kind": e["kind"], "text": e["text"]} for e in ss.events]),
                          width="stretch", hide_index=True)
@@ -410,7 +469,7 @@ with research_tab:
             if rep.removed:
                 st.dataframe(pd.DataFrame(rep.removed), width="stretch", hide_index=True)
             else:
-                st.write("Verification removed nothing.")
+                st.info("Verification removed nothing: every drafted sentence cited a passage that supports it.")
 
         if st.button("Start a new topic"):
             reset()
@@ -424,6 +483,10 @@ with benchmark_tab:
                 "reuse saved Apollo runs); the newest `runs/benchmark-*/benchmark.md` is shown here.")
     else:
         st.caption(f"Newest benchmark: {bench_dir}")
-        st.markdown(no_latex((bench_dir / "benchmark.md").read_text(encoding="utf-8")))
+        try:
+            st.markdown(no_latex((bench_dir / "benchmark.md").read_text(encoding="utf-8")))
+        except (OSError, UnicodeDecodeError) as e:
+            st.error(f"Couldn't read {bench_dir / 'benchmark.md'} ({type(e).__name__}). Run "
+                     f"`python -m scripts.benchmark` again to write a new one.")
 
 show_models()

@@ -61,7 +61,7 @@ def test_models_panel_live_and_after_the_run():
     pipeline.LLM = lambda budget: UIFakeLLM()
     assert "No run yet." in _sidebar(AppTest.from_file(APP, default_timeout=60).run())
     at = _app(review_gaps=True)
-    _click(at, "Approve plan and start research")              # paused after round 1: the panel is live
+    _click(at, "Approve plan")              # paused after round 1: the panel is live
     side = _sidebar(at)
     state = at.session_state["run"]
     tavily = sum(x["source"] in ("web", "news") and x["status"] != "failed" for x in state.search_log)
@@ -90,7 +90,7 @@ def test_plan_editor_accepts_any_source_subset():
     at.session_state["plan_editor"] = {"edited_rows": {0: {"sources": ["arxiv", "edgar"]}}, "added_rows": [],
                                        "deleted_rows": []}
     at.run()
-    _click(at, "Approve plan and start research")
+    _click(at, "Approve plan")
     state = at.session_state["run"]
     assert state.plan.subqs["q1"].source_types == ["arxiv", "edgar"], state.plan.subqs["q1"].source_types
     assert {s["source"] for s in state.search_log if s["sq"] == "q1"} == {"arxiv", "edgar"}, "no web for q1"
@@ -104,8 +104,8 @@ def test_brief_frontend_checklist():
     assert {"Maximum research rounds", "Time limit for research (minutes)", "Token budget", "Source types",
             "Let me review the plan before searching", "Review gaps between rounds"} <= labels, labels
     assert at.text_input[0].label == "Research topic"
-    assert any(b.label == "Approve plan and start research" for b in at.button), "plan approval"
-    _click(at, "Approve plan and start research")
+    assert any(b.label == "Approve plan" for b in at.button), "plan approval"
+    _click(at, "Approve plan")
     log = _markdown(at)                                         # live progress: plan, searches, reviews, gaps
     for icon, kind in (("🗺️", "plan"), ("🔎", "search"), ("🧐", "review"), ("🕳️", "gap")):
         assert icon in log, f"no {kind} line in the live log"
@@ -153,7 +153,7 @@ def test_benchmark_tab_shows_the_newest_benchmark():
 
 def test_full_run_with_the_toggle_off():
     at = _app(review_gaps=False)
-    _click(at, "Approve plan and start research")
+    _click(at, "Approve plan")
     rep = at.session_state["report"]
     assert rep is not None and at.session_state["phase"] == "done" and rep.state.round >= 2
     actors = {e["actor"] for e in at.session_state["events"]}
@@ -171,9 +171,9 @@ def test_full_run_with_the_toggle_off():
 
 def test_gap_review_one_round_per_click():
     at = _app(review_gaps=True)
-    _click(at, "Approve plan and start research")
+    _click(at, "Approve plan")
     assert at.session_state["phase"] == "gaps" and at.session_state["run"].round == 1, "stops after one round"
-    assert len(_graphs(at)) == 1 and not any(b.label == "Approve plan and start research" for b in at.button),         "the plan editor is gone once the run starts"
+    assert len(_graphs(at)) == 1 and not any(b.label == "Approve plan" for b in at.button),         "the plan editor is gone once the run starts"
     assert at.session_state["report"] is None
     md = _markdown(at)
     assert ":blue[**Apollo**]" in md and ":green[**Athena**]" in md and ":orange[**Hermes**]" in md
@@ -197,13 +197,72 @@ def test_gap_review_one_round_per_click():
 
 def test_rerun_mid_round_does_not_crash():
     at = _app(review_gaps=True)
-    _click(at, "Approve plan and start research")
+    _click(at, "Approve plan")
     at.session_state["phase"] = "round"                          # as if the page reran while a round was running
     at.run()
-    assert not at.exception and any("interrupted" in w.value for w in at.warning)
-    _click(at, "Write report from what was found")
+    assert not at.exception and any("stopped before it finished" in w.value for w in at.warning)
+    _click(at, "Write report now")
     assert at.session_state["report"] is not None and at.session_state["phase"] == "done"
     assert at.session_state["report"].state.stop_reason.startswith("user chose to write")
+
+
+def test_empty_states_say_what_to_do():
+    agents.run_search = fake_search
+    pipeline.LLM = lambda budget: UIFakeLLM()
+    at = AppTest.from_file(APP, default_timeout=60).run()
+    assert any("press **Plan research**" in i.value for i in at.info), "research tab before any plan"
+    assert "Plan a topic to see the active models" in _sidebar(at)
+    at = _app(review_gaps=False)
+    agents.run_search = lambda query, source_type, limits: []          # nothing found at all (searches start now)
+    _click(at, "Approve plan")
+    infos = [i.value for i in at.info]
+    assert any(v.startswith("No sources were collected") and "TAVILY_API_KEYS" in v for v in infos), infos
+    assert not any("url" in d.value.columns for d in at.dataframe), "no empty sources table"
+
+
+def test_errors_explain_the_fix_without_a_stack_trace():
+    from apollo.llm import AllProvidersFailed
+
+    def no_models(budget):
+        raise RuntimeError("No usable LLM in STRONG_CHAIN. Fill in .env (keys and provider:model entries) "
+                           "and run: python -m scripts.check_keys")
+
+    class EveryModelDown(UIFakeLLM):
+        def json(self, system, user, **kw):
+            raise AllProvidersFailed("All strong models failed: nvidia key #1: auth")
+    agents.run_search = fake_search
+    for make, expected in ((no_models, "STRONG_CHAIN"),
+                           (lambda budget: EveryModelDown(), "No language model answered while planning")):
+        pipeline.LLM = make
+        at = AppTest.from_file(APP, default_timeout=60).run()
+        at.text_input[0].input(TOPIC).run()
+        _click(at, "Plan research")
+        errors = [e.value for e in at.error]
+        assert any(expected in e for e in errors) and any("check_keys" in e for e in errors), errors
+    real_route = pipeline.route
+    pipeline.route = lambda state, budget: (_ for _ in ()).throw(ValueError("route broke"))   # a bug mid-round
+    try:
+        pipeline.LLM = lambda budget: UIFakeLLM()
+        at = _app(review_gaps=False)
+        _click(at, "Approve plan")
+        errors = [e.value for e in at.error]
+        assert any("Something went wrong during the run (ValueError: route broke)" in e for e in errors), errors
+        assert any(b.label == "Write report now" for b in at.button)
+    finally:
+        pipeline.route = real_route
+    _click(at, "Write report now")                                     # recovers: writes from what was found
+    assert at.session_state["report"] is not None
+
+
+def test_button_labels_are_the_standard_ones():
+    at = _app(review_gaps=True)
+    seen = {b.label for b in at.button}
+    _click(at, "Approve plan")
+    seen |= {b.label for b in at.button}
+    _click(at, "Write report now")
+    seen |= {b.label for b in at.button} | {e.proto.label for e in at.get("download_button")}
+    assert seen == {"Plan research", "Approve plan", "Run next round", "Write report now", "Start a new topic",
+                    "Download Markdown", "Download PDF", "Download provenance JSON"}, seen
 
 
 def main():
@@ -214,7 +273,9 @@ def main():
                   test_plan_editor_accepts_any_source_subset, test_brief_frontend_checklist,
                   test_benchmark_tab_shows_the_newest_benchmark,
                   test_full_run_with_the_toggle_off,
-                  test_gap_review_one_round_per_click, test_rerun_mid_round_does_not_crash):
+                  test_gap_review_one_round_per_click, test_rerun_mid_round_does_not_crash,
+                  test_empty_states_say_what_to_do, test_errors_explain_the_fix_without_a_stack_trace,
+                  test_button_labels_are_the_standard_ones):
             t()
             print("ok  ", t.__name__)
     finally:

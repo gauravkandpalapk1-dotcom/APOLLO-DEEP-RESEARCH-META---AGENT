@@ -65,11 +65,25 @@ def test_highlight_and_plain_sentence():
     assert r"\*fast\*" in out, "markdown in web text is escaped"
 
 
+def test_reference_titles_never_just_a_url():
+    from apollo.state import Chunk
+    from apollo.writer import ref_title, render_citations
+    url = "https://www.ijfmr.com/papers/2024/1/37143.pdf"
+    for title in ("", None, "   ", url, "www.ijfmr.com/papers/2024/1/37143.pdf/", "HTTPS://WWW.IJFMR.COM/papers/2024/1/37143.pdf"):
+        assert ref_title(title, url) == "ijfmr.com: 37143.pdf", (title, ref_title(title, url))
+    assert ref_title("", "https://x.org/Annual%20Report%202025.pdf") == "x.org: Annual Report 2025.pdf"
+    assert ref_title("", "https://gsem.gujarat.gov.in") == "gsem.gujarat.gov.in"           # no path: the site only
+    assert ref_title("A real  title", url) == "A real title"
+    chunks = {"C1": Chunk("C1", "q1", url, url, "text", "web", None, None, 1.0, 1)}
+    md, refs = render_citations("A fact [C1].", chunks)
+    assert refs[0]["title"] == "ijfmr.com: 37143.pdf" and md == f"A fact [[1]]({url})."
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for t in (test_report_sentences_carry_their_evidence, test_dedupe_marks_the_duplicate_record,
-              test_highlight_and_plain_sentence):
+              test_highlight_and_plain_sentence, test_reference_titles_never_just_a_url):
         t()
         print("ok  ", t.__name__)
     print("ALL EVIDENCE TESTS PASSED")

@@ -3,6 +3,7 @@ import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from urllib.parse import unquote, urlsplit
 
 from .agents import status_counts
 from .config import CHUNK_DATA_RULE
@@ -336,6 +337,19 @@ def limitations(state: RunState, results: list[SectionResult], unverified: int =
     return "\n".join(lines)
 
 
+def ref_title(title: str, url: str) -> str:
+    """A source's display title. With no title, or a title that is just the URL, show the site and the file name
+    instead, e.g. "ijfmr.com: 37143.pdf" (or only the site when the URL has no path)."""
+    title = " ".join(str(title or "").split())
+    bare = lambda u: re.sub(r"^(https?://)?(www\.)?", "", u.strip().lower()).rstrip("/")
+    if title and bare(title) != bare(url):
+        return title
+    parts = urlsplit(url)
+    site = (parts.hostname or url).lower().removeprefix("www.")
+    name = unquote(parts.path.rstrip("/").rsplit("/", 1)[-1]) if parts.path.strip("/") else ""
+    return f"{site}: {name}" if name else site
+
+
 def render_citations(markdown: str, chunks: dict[str, Chunk]) -> tuple[str, list[dict]]:
     """Replace [C3, C9] with numbered, clickable [1][2] references ordered by first use."""
     numbers, refs = {}, []
@@ -348,7 +362,7 @@ def render_citations(markdown: str, chunks: dict[str, Chunk]) -> tuple[str, list
                 continue
             if c.url not in numbers:
                 numbers[c.url] = len(numbers) + 1
-                refs.append({"n": numbers[c.url], "url": c.url, "title": c.title,
+                refs.append({"n": numbers[c.url], "url": c.url, "title": ref_title(c.title, c.url),
                              "type": c.source_type, "published": c.published or (str(c.year) if c.year else "")})
             out.append(f"[[{numbers[c.url]}]]({c.url})")
         return "".join(out)
@@ -367,7 +381,8 @@ def sentence_evidence(records: list[VerifiedSentence], chunks: dict[str, Chunk],
 
     out = []
     for v in records:
-        evidence = [{"ref_number": number.get(c.url), "chunk_id": c.id, "url": c.url, "title": c.title,
+        evidence = [{"ref_number": number.get(c.url), "chunk_id": c.id, "url": c.url,
+                     "title": ref_title(c.title, c.url),
                      "domain": c.domain, "published": c.published or (str(c.year) if c.year else ""),
                      "passage": c.text}
                     for c in (chunks.get(cid) for cid in dict.fromkeys(v.chunk_ids)) if c]
