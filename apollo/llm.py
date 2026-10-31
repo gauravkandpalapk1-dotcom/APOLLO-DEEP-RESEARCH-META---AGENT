@@ -48,13 +48,28 @@ class Budget:
 
 
 def parse_json(text: str) -> dict:
-    """Models sometimes wrap JSON in fences or add a sentence; take the outermost object."""
+    """Models sometimes wrap JSON in fences, add a sentence, or send several objects one after another; return the
+    first whole object, with any further top-level objects under "_more_objects"."""
     text = THINK_BLOCK.sub("", text)
     text = re.sub(r"```(?:json)?", "", text).strip()
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end == -1:
         raise ValueError(f"No JSON object in model output: {text[:200]!r}")
-    return json.loads(text[start:end + 1])
+    decoder = json.JSONDecoder()
+    try:
+        first, pos = decoder.raw_decode(text, start)
+    except json.JSONDecodeError:
+        return json.loads(text[start:end + 1])
+    more = []
+    while (pos := text.find("{", pos)) != -1:
+        try:
+            obj, pos = decoder.raw_decode(text, pos)
+        except json.JSONDecodeError:
+            break
+        more.append(obj)
+    if more and isinstance(first, dict):
+        first["_more_objects"] = more
+    return first
 
 
 @dataclass(frozen=True)

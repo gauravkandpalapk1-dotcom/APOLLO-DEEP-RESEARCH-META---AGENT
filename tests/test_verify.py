@@ -1,12 +1,13 @@
 """Offline tests of claim verification: batches of 6, one retry for sentences without a verdict, removal of
 anything still unverified, the reasons logged as system events, and the stop summaries.
 Run: python -m tests.test_verify"""
+import json
 import re
 import sys
 
 from apollo import agents, pipeline
 from apollo.config import Limits
-from apollo.llm import Budget
+from apollo.llm import Budget, parse_json
 from apollo.pipeline import Apollo
 from apollo.state import Chunk
 from apollo.writer import UNVERIFIED, VERIFY_BATCH, VERIFY_RETRY_BATCH, removed_of, verify
@@ -74,6 +75,16 @@ def test_nothing_unverified_is_ever_kept():
     assert kept == 0 and text == "" and len(removed) == 8 and all(why == UNVERIFIED for _, why in removed)
 
 
+def test_bare_verdict_objects_are_accepted():
+    class BareVerdicts(SkippingVerifier):                   # one {"i": n, ...} object per sentence, no "results"
+        def json(self, system, user, **kw):
+            verdicts = super().json(system, user, **kw)["results"]
+            return parse_json("\n".join(json.dumps(v) for v in verdicts))
+    text, kept, removed, problems = _verify(" ".join(f"Plain fact number {k} [C1]." for k in range(3)), ALLOWED,
+                                            BareVerdicts())
+    assert kept == 3 and not removed and not problems, (removed, problems)
+
+
 def test_pipeline_logs_problems_and_counts_unverified():
     class SkipDrones(FakeLLM):                               # the fake verifier never answers "Drones ..." sentences
         def json(self, system, user, **kw):
@@ -112,7 +123,8 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for t in (test_skipped_items_are_retried_then_removed, test_failed_call_is_logged_and_retried,
-              test_nothing_unverified_is_ever_kept, test_pipeline_logs_problems_and_counts_unverified,
+              test_nothing_unverified_is_ever_kept, test_bare_verdict_objects_are_accepted,
+              test_pipeline_logs_problems_and_counts_unverified,
               test_no_follow_up_stop_reason_has_counts):
         t()
         print("ok  ", t.__name__)

@@ -9,7 +9,7 @@ from apollo.agents import (REVIEW_SYSTEM, _apply_relevance, _apply_review, athen
 from apollo.config import Limits
 from apollo.pipeline import Apollo
 from apollo.state import Chunk, RunState
-from apollo.writer import section_evidence
+from apollo.writer import limitations, section_evidence
 from tests.test_offline import FakeLLM, fake_search
 
 LIMITS = Limits(enabled_sources=("web",))
@@ -68,6 +68,10 @@ def test_writers_see_only_relevant_chunks():
     state.plan.subqs["q1"].relevant_chunk_ids = ["C2"]
     by_section = {s.id: [c.id for c in section_evidence(state, s)] for s in state.plan.sections}
     assert by_section == {"s1": ["C2"], "s2": ["C4", "C5", "C6"]}, by_section   # q2 not judged: all its chunks
+    state.plan.subqs["q2"].relevant_chunk_ids = ["C4"]
+    state.contradictions = [{"sq_id": "q1", "chunk_ids": ["C1", "C5"], "description": "x"}]   # C5 is q2's, unjudged
+    by_section = {s.id: [c.id for c in section_evidence(state, s)] for s in state.plan.sections}
+    assert by_section == {"s1": ["C2", "C1", "C5"], "s2": ["C4"]}, by_section   # both sides go to q1's writer
 
 
 def test_empty_arxiv_and_edgar_are_no_results():
@@ -109,6 +113,8 @@ def test_failure_path_end_to_end():
     lim = rep.markdown[rep.markdown.index("## Limitations"):]
     assert f"No usable sources found for: *{q4.question}*" in lim
     assert st.plan.subqs["q3"].status == "unfillable" and "search call(s) returned nothing" in lim
+    assert any(e.kind == "gap" and e.data.get("sq") == "q3" and e.data["detail"] == "no sources found"
+               for e in events), "nothing found at all is not reported as 'no relevant evidence'"
     assert any("the search returned nothing" in e.text for e in events if e.kind == "search_fail")
     assert not any(ev["chunk_id"] in st.chunks and st.chunks[ev["chunk_id"]].sq_id == "q4"
                    for x in rep.sentences for ev in x["evidence"]), "writers never cite q4's irrelevant chunks"
@@ -179,13 +185,33 @@ def test_hermes_is_asked_for_conflicting_figures():
     assert [c["description"] for c in state.contradictions] == ["two sites"]
 
 
+def test_hermes_non_conflicts_dropped_and_descriptions_readable():
+    assert "List only real\nconflicts" in inspect.getsource(agents._review_section)
+    state = _state()
+    q1 = state.plan.subqs["q1"]
+    long = "C1 says the subsidy is 50% while C3 says 40% " + "for the same fab scheme " * 20
+    _apply_review(state, [q1], {"sub_questions": [], "contradictions": [
+        {"sq_id": "q1", "chunk_ids": ["C1", "C2"], "description": "C1 implies broader limits than C2. No direct "
+                                                                  "value conflict, but the scope differs."},
+        {"sq_id": "q1", "chunk_ids": ["C2", "C3"], "description": "They do not contradict each other."},
+        {"sq_id": "q1", "chunk_ids": ["C2", "C1"], "description": "31% are AI leaders while 65% use AI, indicating "
+                                                                  "different metrics and scopes."},
+        {"sq_id": "q1", "chunk_ids": ["C1", "C3"], "description": long}]})
+    assert len(state.contradictions) == 1, state.contradictions          # the three self-declared non-conflicts dropped
+    desc = state.contradictions[0]["description"]
+    assert desc.startswith("q1-0.example says the subsidy is 50% while q1-2.example says 40%"), desc
+    assert desc.endswith("…") and len(desc) <= agents.DESCRIPTION_CHARS + 1 and not desc[:-1].endswith(" ")
+    assert "Sources disagreed: q1-0.example says" in limitations(state, [])
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for t in (test_relevance_is_stored_merged_and_validated, test_no_relevant_evidence_gap_then_unfillable,
               test_writers_see_only_relevant_chunks, test_empty_arxiv_and_edgar_are_no_results,
               test_failure_path_end_to_end, test_quantity_normalises_units_and_scale,
-              test_contradictions_after_normalising, test_hermes_is_asked_for_conflicting_figures):
+              test_contradictions_after_normalising, test_hermes_is_asked_for_conflicting_figures,
+              test_hermes_non_conflicts_dropped_and_descriptions_readable):
         t()
         print("ok  ", t.__name__)
     print("ALL FAILURE AND CONFLICT TESTS PASSED")

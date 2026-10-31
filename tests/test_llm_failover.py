@@ -12,7 +12,7 @@ os.environ.update({
     "FAST_CHAIN": "nvidia:nvidia/nemotron-super,gemini:gemini-flash,groq:GROQ_MODEL_ID,nvidia:org/model:free",
 })
 
-from apollo.llm import LLM, AllProvidersFailed, Budget, parse_chain  # noqa: E402
+from apollo.llm import LLM, AllProvidersFailed, Budget, parse_chain, parse_json  # noqa: E402
 
 
 class FakeError(Exception):
@@ -160,6 +160,12 @@ def test_tavily_rotation():
     finally:
         requests.post = real
     assert docs and docs2 and seen == ["tv1", "tv2", "tv2"], seen
+
+
+def test_parse_json_takes_the_first_object():
+    assert parse_json('```json\n{"a": 1}\n```') == {"a": 1}
+    assert parse_json('{"i": 0}\n{"i": 1}\n{"i": 2}') == {"i": 0, "_more_objects": [{"i": 1}, {"i": 2}]}
+    assert parse_json('Here: {"a": {"b": 2}} (end of {reply})') == {"a": {"b": 2}}    # braces after the object
 
 
 def main():

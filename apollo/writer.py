@@ -39,12 +39,20 @@ WRITER_SYSTEM = ("You are a section writer for a research report. You write only
 
 
 def section_evidence(state: RunState, section: Section) -> list[Chunk]:
-    """Each sub-question's best chunks, only those Hermes judged relevant (all of them if it never judged)."""
+    """Each sub-question's best chunks, only those Hermes judged relevant (all of them if it never judged), plus both
+    sides of every contradiction in this section, so the writer can cite both figures."""
     out = []
     for qid in section.subq_ids:
         sq = state.plan.subqs[qid]
         only = None if sq.relevant_chunk_ids is None else set(sq.relevant_chunk_ids)
         out.extend(state.top_chunks(qid, state.limits.chunks_per_sq, only))
+    have = {c.id for c in out}
+    for con in state.contradictions:
+        if con["sq_id"] in section.subq_ids:
+            for cid in con["chunk_ids"]:
+                if cid not in have and cid in state.chunks:
+                    out.append(state.chunks[cid])
+                    have.add(cid)
     return out
 
 
@@ -166,6 +174,8 @@ def _check(entries: list, size: int, allowed: dict[str, Chunk], llm: LLM, proble
                            '\n\nFor each item, is every fact in the sentence stated in its sources?\n'
                            'JSON: {"results": [{"i": 0, "supported": true, "reason": "short"}]}', role="fast")
             results = res.get("results") if isinstance(res, dict) else None
+            if not isinstance(results, list) and isinstance(res, dict):   # bare verdicts, one object per sentence
+                results = [r for r in [res, *res.pop("_more_objects", [])] if isinstance(r, dict) and "i" in r]
             for r in results if isinstance(results, list) else []:
                 if isinstance(r, dict) and str(r.get("i", "")).isdigit() and int(r["i"]) < len(batch):
                     verdict[int(r["i"])] = r
@@ -288,7 +298,7 @@ def limitations(state: RunState, results: list[SectionResult], unverified: int =
             else:
                 lines.append(f"- {label} for: *{sq.question}* ({sq.status_reason}).")
     for con in state.contradictions:
-        lines.append(f"- Sources disagreed on {con['description']} (see the cited figures in that section).")
+        lines.append(f"- Sources disagreed: {con['description']} (see the cited figures in that section).")
     for source, problem in state.unavailable_sources.items():
         lines.append(f"- The {source} source was unavailable during this run: {problem}")
     if state.failed_searches:

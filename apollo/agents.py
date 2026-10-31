@@ -292,7 +292,9 @@ do (a chunk on a different place, product or topic does not count).
 "source_years" gives the year a chunk's information refers to, only when the chunk states it.
 "contradictions": look actively for figures that conflict between sources. List two chunks from different websites
 that give different values for the same thing, e.g. one chunk says a market was worth $4.2 billion in 2024 and
-another says $7.8 billion for 2024. Also list other incompatible facts about the same thing."""
+another says $7.8 billion for 2024. Also list other incompatible facts about the same thing. List only real
+conflicts: if the chunks merely differ in detail, or describe different places, years or products, leave it out.
+Write each description as one plain sentence under 250 characters."""
     return llm.json(REVIEW_SYSTEM, user, role="fast")
 
 
@@ -363,13 +365,33 @@ def _apply_review(state: RunState, sqs: list[SubQ], review: dict) -> int:
         chunk_ids = con.get("chunk_ids")
         cids = [x for x in (chunk_ids if isinstance(chunk_ids, list) else []) if str(x) in state.chunks]
         domains = {state.chunks[x].domain for x in cids}
+        description = str(con.get("description", ""))
+        if NOT_A_CONFLICT.search(description):            # Hermes listed it but says itself it isn't a conflict
+            continue
         if len(cids) >= 2 and len(domains) >= 2 and con.get("sq_id") in ids:   # one site disagreeing with itself isn't
             if not any(set(cids) == set(x["chunk_ids"]) for x in state.contradictions):
                 state.contradictions.append({"sq_id": con["sq_id"], "chunk_ids": cids,
-                                             "description": str(con.get("description", ""))[:300],
+                                             "description": readable_description(state, description),
                                              "follow_up_query": str(con.get("follow_up_query", ""))[:200],
                                              "chased": False, "found_by": "hermes"})
     return skipped
+
+
+NOT_A_CONFLICT = re.compile(r"\bno (?:direct |real |actual |clear )?(?:value |numeric |numerical )?"
+                            r"(?:conflict|contradiction|disagreement)|\bnot (?:a |an )?(?:direct |real |actual )?"
+                            r"(?:conflict|contradiction)|\bdo(?:es)? not (?:directly )?(?:conflict|contradict)"
+                            r"|\bdifferent (?:metrics|measures|scopes?|definitions)\b", re.I)
+CHUNK_REF = re.compile(r"\bC\d+\b")
+DESCRIPTION_CHARS = 300
+
+
+def readable_description(state: RunState, text: str) -> str:
+    """Chunk ids mean nothing to a reader: name the website instead. Cut at a word boundary, marked with "…"."""
+    text = " ".join(CHUNK_REF.sub(lambda m: state.chunks[m.group()].domain if m.group() in state.chunks
+                                  else m.group(), text).split())
+    if len(text) <= DESCRIPTION_CHARS:
+        return text
+    return text[:DESCRIPTION_CHARS].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
 
 
 def _apply_relevance(state: RunState, sq: SubQ, raw):
@@ -502,7 +524,9 @@ def route(state: RunState, budget) -> tuple[str, str, list[dict]]:
             continue
         usable = state.usable_chunks(sq)             # only chunks Hermes judged relevant, once it has judged
         sq_gaps, n_domains = [], len({c.domain for c in usable})
-        if sq.relevant_chunk_ids is not None and not usable:
+        if not state.chunks_for(sq.id):                # every search failed or came back empty
+            sq_gaps.append({"type": "coverage", "detail": "no sources found"})
+        elif sq.relevant_chunk_ids is not None and not usable:
             sq_gaps.append({"type": "coverage", "detail": "no relevant evidence"})
         elif n_domains < limits.min_domains_per_sq:   # independent sources: pages on one site count once
             sq_gaps.append({"type": "coverage", "detail": f"only {n_domains} domain(s)"})
