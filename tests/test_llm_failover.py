@@ -1,5 +1,6 @@
 """Offline tests for multi-key, multi-model failover. Run: python -m tests.test_llm_failover"""
 import os
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -162,6 +163,8 @@ def test_tavily_rotation():
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for t in tests:
         t()

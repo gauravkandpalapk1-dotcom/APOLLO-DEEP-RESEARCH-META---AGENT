@@ -3,6 +3,7 @@ Checks: two-round loop, empty/failed searches handled, stop logic, citation veri
 Run: python -m tests.test_offline"""
 import json
 import re
+import sys
 
 from apollo import agents
 from apollo.config import Limits
@@ -94,6 +95,8 @@ def fake_search(query, source_type, limits):
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     agents.run_search = fake_search
     app = Apollo(Limits(max_rounds=3, parallel_searches=2), llm=FakeLLM())
     plan = app.plan("Impact of AI on Indian agriculture")

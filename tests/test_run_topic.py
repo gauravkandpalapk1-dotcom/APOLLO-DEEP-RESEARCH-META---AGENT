@@ -2,6 +2,7 @@
 Checks: files written on success, events.jsonl + error.txt on failure, one broken source never breaks a run.
 Run: python -m tests.test_run_topic"""
 import json
+import sys
 import tempfile
 from pathlib import Path
 
@@ -114,6 +115,8 @@ def test_parse_sources():
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         for test in (test_success_writes_all_files, test_dropped_intro_falls_back_to_section_list,

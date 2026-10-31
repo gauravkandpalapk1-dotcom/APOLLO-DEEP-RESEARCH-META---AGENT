@@ -2,6 +2,7 @@
 Gemini's "models/" prefix removed, a dead first key falls through to the next one.
 Run: python -m tests.test_list_models"""
 import io
+import sys
 from contextlib import redirect_stdout
 from types import SimpleNamespace
 
@@ -25,6 +26,8 @@ def fake_factory(key, base_url):
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     providers = {"gemini": {"keys": [SECRET_DEAD, SECRET_GOOD], "base_url": "https://gemini.example"},
                  "groq": {"keys": [SECRET_GOOD], "base_url": "https://groq.example"},
                  "hf": {"keys": [SECRET_DEAD], "base_url": "https://hf.example"}}

@@ -2,6 +2,7 @@
 round trip, Hermes' verdicts by criterion id, the "criteria" gap in route(), and the guards that skip
 malformed LLM items instead of crashing. Run: python -m tests.test_criteria"""
 import re
+import sys
 from datetime import datetime
 
 import pandas as pd
@@ -239,6 +240,8 @@ def test_hermes_junk_items_are_skipped_with_a_warning():
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for t in (test_planner_prompt_asks_for_criteria_with_a_relative_year, test_old_years_in_criteria_are_rewritten,
               test_criterion_cut_at_word_boundary_keeps_or_later,
               test_criteria_ids_cap_trim_dedupe_and_junk,

@@ -210,6 +210,8 @@ def run_benchmark(topics: list[str], limits: Limits, out_dir: str | Path, seed: 
 
 
 def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     p = argparse.ArgumentParser(description="Benchmark Apollo against the single-shot baseline.")
     p.add_argument("--topics", default="benchmark_topics.txt")
     p.add_argument("--rounds", type=int, default=Limits.max_rounds)
@@ -218,8 +220,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=0, help="only the first N topics")
     p.add_argument("--seed", type=int, default=0, help="seed for picking hand-check sentences")
     args = p.parse_args(argv)
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     topics = read_topics(args.topics)[:args.limit or None]
     if not topics:
         p.error(f"no topics in {args.topics}")

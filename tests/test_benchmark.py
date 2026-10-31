@@ -4,6 +4,7 @@ Run: python -m tests.test_benchmark"""
 import csv
 import json
 import re
+import sys
 import tempfile
 from pathlib import Path
 
@@ -127,6 +128,8 @@ def test_handcheck_sample_is_reproducible():
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for t in (test_baseline_writes_files_and_verifies, test_baseline_failure_saves_events_and_error,
               test_metric_helpers, test_benchmark_records_failures_and_never_invents_numbers,
               test_handcheck_sample_is_reproducible):

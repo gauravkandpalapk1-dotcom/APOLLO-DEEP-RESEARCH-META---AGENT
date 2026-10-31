@@ -1,6 +1,8 @@
 """Offline tests of the evidence inspector data: every report sentence with its verdict, reason and the exact
 passages it cites, reference numbers that match the report, duplicates marked, and the bold-overlap helper.
 Run: python -m tests.test_evidence"""
+import sys
+
 from apollo import agents
 from apollo.config import Limits
 from apollo.pipeline import Apollo
@@ -64,6 +66,8 @@ def test_highlight_and_plain_sentence():
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for t in (test_report_sentences_carry_their_evidence, test_dedupe_marks_the_duplicate_record,
               test_highlight_and_plain_sentence):
         t()

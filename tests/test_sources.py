@@ -1,6 +1,8 @@
 """Offline tests of source independence: domains and source classes, coverage by distinct domains,
 contradictions only across domains, the search-call cap and the "no new domains" stop.
 Run: python -m tests.test_sources"""
+import sys
+
 from apollo import agents
 from apollo.agents import REVIEW_SYSTEM, numeric_contradictions, route, validate_plan
 from apollo.config import CHUNK_DATA_RULE, Limits
@@ -98,6 +100,8 @@ def test_every_prompt_with_retrieved_text_has_the_data_rule():
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for t in (test_domain_and_classify_source, test_same_domain_does_not_cover, test_contradiction_needs_two_domains,
               test_search_cap_stops_the_run, test_no_new_domains_stop, test_every_prompt_with_retrieved_text_has_the_data_rule):
         t()
