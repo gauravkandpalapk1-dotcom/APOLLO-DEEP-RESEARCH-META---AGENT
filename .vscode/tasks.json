@@ -1,0 +1,65 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Setup (first time)",
+      "type": "shell",
+      "windows": {
+        "command": ".\\setup.bat"
+      },
+      "linux": {
+        "command": "bash setup.sh"
+      },
+      "osx": {
+        "command": "bash setup.sh"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Check keys",
+      "type": "shell",
+      "windows": {
+        "command": ".venv\\Scripts\\python -m scripts.check_keys"
+      },
+      "linux": {
+        "command": ".venv/bin/python -m scripts.check_keys"
+      },
+      "osx": {
+        "command": ".venv/bin/python -m scripts.check_keys"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Run tests",
+      "type": "shell",
+      "windows": {
+        "command": ".venv\\Scripts\\python -m tests.run_all"
+      },
+      "linux": {
+        "command": ".venv/bin/python -m tests.run_all"
+      },
+      "osx": {
+        "command": ".venv/bin/python -m tests.run_all"
+      },
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Run Apollo app",
+      "type": "shell",
+      "windows": {
+        "command": ".venv\\Scripts\\python -m streamlit run app.py"
+      },
+      "linux": {
+        "command": ".venv/bin/python -m streamlit run app.py"
+      },
+      "osx": {
+        "command": ".venv/bin/python -m streamlit run app.py"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

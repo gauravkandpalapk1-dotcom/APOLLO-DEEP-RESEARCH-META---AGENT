@@ -1,0 +1,17 @@
+{
+  "python.terminal.activateEnvironment": true,
+  "python.envFile": "${workspaceFolder}/.env",
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.pyc": true
+  },
+  "files.watcherExclude": {
+    "**/.venv/**": true,
+    "**/runs/**": true
+  },
+  "search.exclude": {
+    "**/.venv": true,
+    "**/runs": true
+  },
+  "editor.formatOnSave": false
+}
