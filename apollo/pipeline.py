@@ -7,6 +7,7 @@ import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 
+from . import config
 from .agents import (GAP_PRIORITY, apollo_plan, athena, close_open, follow_up_jobs, gap_query, hermes, route,
                      status_summary)
 from .config import Limits
@@ -64,6 +65,10 @@ class Apollo:
     def research(self, plan: Plan):
         """Generator of Events. The last event has kind 'done' and data={'report': Report}.
         The whole run in one go: every gap Apollo finds is approved and followed up."""
+        if config.ORCHESTRATOR == "langgraph":         # the same run as a LangGraph StateGraph (apollo/graph.py)
+            from .graph import research
+            yield from research(self, plan)
+            return
         state = self.start_run(plan)
         while not state.done:
             yield from self.run_round(state)

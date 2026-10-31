@@ -21,6 +21,16 @@ def search_depth(raw: str | None) -> str:
 
 SEARCH_DEPTH = search_depth(os.environ.get("SEARCH_DEPTH"))
 
+
+def orchestrator(raw: str | None) -> str:
+    """Which runner Apollo.research() uses: "python" (the default, apollo/pipeline.py) or "langgraph"
+    (apollo/graph.py, the same run as a LangGraph StateGraph). Anything else, or unset, means python."""
+    value = (raw or "").strip().lower()
+    return value if value in ("python", "langgraph") else "python"
+
+
+ORCHESTRATOR = orchestrator(os.environ.get("ORCHESTRATOR"))
+
 # ---------- source classes (editable; matched against the domain, "www." removed) ----------
 # A suffix matches the end of the domain (".gov" matches "epa.gov"); a domain matches itself and its subdomains.
 GOVERNMENT_SUFFIXES = (".gov", ".gov.in", ".nic.in", ".gov.uk", ".gc.ca", ".europa.eu")

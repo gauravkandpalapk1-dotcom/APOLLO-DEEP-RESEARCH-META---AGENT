@@ -4,3 +4,4 @@ streamlit>=1.50
 pandas>=2.0
 fpdf2>=2.7
 python-dotenv>=1.0
+langgraph==1.2.19
