@@ -46,7 +46,7 @@ def _state(criteria, n_urls=2):
     for sq in plan.subqs.values():
         for k in range(n_urls):
             cid = f"C{len(state.chunks) + 1}"
-            state.chunks[cid] = Chunk(cid, sq.id, f"https://{sq.id}.example/{k}", "t", "text", "web",
+            state.chunks[cid] = Chunk(cid, sq.id, f"https://{sq.id}-{k}.example/", "t", "text", "web",
                                       "2025-01-01", 2025, 1.0, 1)
         sq.answered = True
     return state

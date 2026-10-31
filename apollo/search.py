@@ -5,11 +5,14 @@ import re
 import threading
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 import requests
 
-from .config import Limits, env
+from .config import (ACADEMIC_DOMAINS, ACADEMIC_SECOND_LEVEL, ACADEMIC_SUFFIXES, FILING_PREFIXES, GOVERNMENT_DOMAINS,
+                     GOVERNMENT_SUFFIXES, Limits, env)
+from .state import domain_of
 
 
 @dataclass
@@ -19,11 +22,42 @@ class Doc:
     text: str
     source_type: str          # web | news | arxiv | edgar
     published: str | None     # date string if the API gives one
+    domain: str = field(init=False)
+    source_class: str = field(init=False)
+
+    def __post_init__(self):
+        self.domain = domain_of(self.url)
+        self.source_class = classify_source(self.url, self.source_type)
 
     @property
     def year(self) -> int | None:
         m = re.search(r"(19|20)\d{2}", self.published or "")
         return int(m.group()) if m else None
+
+
+def _in(domain: str, names) -> bool:
+    return any(domain == d or domain.endswith("." + d) for d in names)
+
+
+def classify_source(url: str, source_type: str) -> str:
+    """government | academic | filing | news | other, from the editable lists in config.py.
+    Order: SEC filing, then anything from the news search, then government, academic, other."""
+    domain = domain_of(url)
+    try:
+        path = urlparse(url).path.lower()
+    except ValueError:
+        path = ""
+    if any((domain + path).startswith(p) for p in FILING_PREFIXES):
+        return "filing"
+    if source_type == "news":
+        return "news"
+    if domain.endswith(GOVERNMENT_SUFFIXES) or _in(domain, GOVERNMENT_DOMAINS):
+        return "government"
+    parts = domain.split(".")
+    if (domain.endswith(ACADEMIC_SUFFIXES) or _in(domain, ACADEMIC_DOMAINS)
+            or (len(parts) >= 3 and parts[-2] in ACADEMIC_SECOND_LEVEL)):
+        return "academic"
+    return "other"
 
 
 class SearchError(Exception):

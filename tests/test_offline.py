@@ -89,7 +89,7 @@ def fake_search(query, source_type, limits):
     if "barriers" in query and "better" not in query:      # q2: thin in round 1, filled in round 2
         return [Doc("Barriers A", "https://a.example/1", "Farmers face cost barriers. " * 20, "web", "2025-01-01")]
     n = len(calls)
-    return [Doc(f"Doc {n}-{k}", f"https://x.example/{n}/{k}", f"Farmers AI adoption data {n} {k}. " * 30,
+    return [Doc(f"Doc {n}-{k}", f"https://site{n}-{k}.example/{n}/{k}", f"Farmers AI adoption data {n} {k}. " * 30,
                 source_type, "2025-03-01") for k in range(2)]
 
 

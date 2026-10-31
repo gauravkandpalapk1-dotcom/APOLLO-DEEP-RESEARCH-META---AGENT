@@ -2,6 +2,7 @@
 import re
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 from .config import Limits
 
@@ -28,6 +29,15 @@ def chunk_text(text: str, size: int = 1200, overlap: int = 150) -> list[str]:
             break
         i = max(end - overlap, i + 1)
     return out
+
+
+def domain_of(url: str) -> str:
+    """Lowercased host without a leading "www.", e.g. https://WWW.PIB.gov.in/x -> pib.gov.in."""
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
 
 
 def relevance(chunk: str, question: str) -> float:
@@ -82,6 +92,12 @@ class Chunk:
     year: int | None
     score: float
     round: int
+    domain: str = ""                 # filled from url when not given
+    source_class: str = "other"      # government | academic | filing | news | other (search.classify_source)
+
+    def __post_init__(self):
+        if not self.domain:
+            self.domain = domain_of(self.url)
 
 
 @dataclass
@@ -104,6 +120,9 @@ class RunState:
     contradictions: list[dict] = field(default_factory=list)
     failed_searches: list[dict] = field(default_factory=list)
     new_sources_this_round: int = 0
+    new_domains_this_round: int = 0                   # new (sub-question, domain) pairs found this round
+    search_calls: int = 0                             # search API calls dispatched so far (capped by Limits)
+    search_cap_hit: bool = False
     stop_reason: str = ""
     review_log: list[dict] = field(default_factory=list)
 
@@ -132,3 +151,6 @@ class RunState:
 
     def distinct_urls(self, sq_id: str) -> set[str]:
         return {c.url for c in self.chunks_for(sq_id)}
+
+    def distinct_domains(self, sq_id: str) -> set[str]:
+        return {c.domain for c in self.chunks_for(sq_id)}
