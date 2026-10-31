@@ -125,6 +125,7 @@ class RunState:
     claims: list[dict] = field(default_factory=list)
     contradictions: list[dict] = field(default_factory=list)
     failed_searches: list[dict] = field(default_factory=list)
+    unavailable_sources: dict[str, str] = field(default_factory=dict)   # source type -> what is wrong (bad key, quota)
     new_sources_this_round: int = 0
     new_domains_this_round: int = 0                   # new (sub-question, domain) pairs found this round
     search_calls: int = 0                             # search API calls dispatched so far (capped by Limits)

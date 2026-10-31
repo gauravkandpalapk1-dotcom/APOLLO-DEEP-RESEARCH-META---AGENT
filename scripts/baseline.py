@@ -17,7 +17,7 @@ from apollo.config import CHUNK_DATA_RULE, Limits
 from apollo.llm import LLM, Budget
 from apollo.search import Doc, tavily
 from apollo.state import Chunk, chunk_text, relevance
-from apollo.writer import UNVERIFIED, render_citations, sentence_evidence, verify
+from apollo.writer import UNVERIFIED, WRITING_RULES, render_citations, sentence_evidence, verify
 from scripts.run_topic import _write_json, slugify
 
 RESULTS = 10          # one search, 10 results with page content
@@ -51,12 +51,7 @@ Evidence:
 {evidence}
 
 Write a research report on the topic: 5 to 8 paragraphs of markdown prose with no headings.
-Rules:
-1. Every sentence that states a fact ends with citations like [C3] or [C3, C9], placed before the full stop.
-2. Cite only chunks whose text directly supports that sentence.
-3. If the evidence does not cover something, say the sources found did not cover it. Never fill gaps from memory.
-4. Where sources disagree, give both figures with their citations.
-5. Give the year of a figure when the chunk states it."""
+{WRITING_RULES}"""
     return llm.chat(BASELINE_SYSTEM, user, temperature=0.3, role="strong")
 
 

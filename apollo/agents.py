@@ -6,7 +6,7 @@ from datetime import datetime
 
 from .config import CHUNK_DATA_RULE, Limits
 from .llm import LLM
-from .search import run_search
+from .search import SourceUnavailable, run_search
 from .state import Chunk, Plan, RunState, Section, SubQ, chunk_text, domain_of, relevance
 
 
@@ -214,6 +214,9 @@ def athena(state: RunState, jobs: list[tuple[SubQ, str]]):
                 docs = fut.result()
             except Exception as e:  # any error from one source is a failed search, never a crashed run
                 state.failed_searches.append({"sq": sq.id, "query": q, "source": st, "error": str(e)[:200]})
+                if isinstance(e, SourceUnavailable) and st not in state.unavailable_sources:
+                    state.unavailable_sources[st] = str(e)       # say what is wrong once, not on every search
+                    yield state.event("warning", f"[{st}] source unavailable: {e}", {"source": st, "problem": str(e)})
                 yield state.event("search_fail", f"[{st}] search failed for {sq.id}: {str(e)[:120]}",
                                   {"sq": sq.id, "query": q})
                 continue

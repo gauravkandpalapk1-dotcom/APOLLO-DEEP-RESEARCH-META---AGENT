@@ -72,13 +72,19 @@ Evidence:
 {evidence}
 
 Write 2 to 4 paragraphs of markdown prose with no headings.
-Rules:
+{WRITING_RULES}"""
+    return llm.chat(WRITER_SYSTEM, user, temperature=0.3, role="strong"), chunks
+
+
+# Shared by the section writers and the single-shot baseline, so both are held to the same citation standard.
+WRITING_RULES = """Rules:
 1. Every sentence that states a fact ends with citations like [C3] or [C3, C9], placed before the full stop.
 2. Cite only chunks whose text directly supports that sentence.
-3. If the evidence does not cover something, say the sources found did not cover it. Never fill gaps from memory.
-4. Where sources disagree, give both figures with their citations.
-5. Give the year of a figure when the chunk states it."""
-    return llm.chat(WRITER_SYSTEM, user, temperature=0.3, role="strong"), chunks
+3. Summary, overview and transition sentences count too: cite the chunks they summarise, or leave them out.
+   Never open or close with an uncited general sentence; uncited sentences are deleted in verification.
+4. If the evidence does not cover something, say the sources found did not cover it. Never fill gaps from memory.
+5. Where sources disagree, give both figures with their citations.
+6. Give the year of a figure when the chunk states it."""
 
 
 # ---------------- verification: code checks, then an LLM support check ----------------
@@ -234,7 +240,10 @@ Report body:
 {body}
 
 Write an introduction (one paragraph saying what the report covers) and a conclusion (one or two paragraphs
-on the main findings and open questions). Reuse the body's citations exactly, e.g. [C3], on every factual sentence.
+on the main findings and open questions). Every sentence ends with citations reused exactly from the body,
+e.g. [C3]: an overview or summary sentence cites the body sentences it summarises. Leave out any sentence you
+cannot cite this way, including a general opening line; uncited sentences are deleted in verification. Only a
+sentence saying the sources did not cover something needs no citation.
 Do not state anything the body does not state.
 JSON: {{"introduction": "...", "conclusion": "..."}}""", role="strong")
     return str(res.get("introduction", "")), str(res.get("conclusion", ""))
@@ -277,6 +286,8 @@ def limitations(state: RunState, results: list[SectionResult], unverified: int =
                 lines.append(f"- {label} for: *{sq.question}* ({sq.status_reason}).")
     for con in state.contradictions:
         lines.append(f"- Sources disagreed on {con['description']} (see the cited figures in that section).")
+    for source, problem in state.unavailable_sources.items():
+        lines.append(f"- The {source} source was unavailable during this run: {problem}")
     if state.failed_searches:
         lines.append(f"- {len(state.failed_searches)} search call(s) failed or timed out and were skipped.")
     removed = sum(why != UNVERIFIED for r in results for _, why in r.removed)

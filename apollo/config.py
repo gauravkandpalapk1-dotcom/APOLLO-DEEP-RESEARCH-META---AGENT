@@ -49,13 +49,18 @@ class Limits:
     results_per_query: int = 5
     chunks_per_sq: int = 6           # evidence chunks per sub-question shown to Hermes / writers
     parallel_searches: int = 4       # Athena worker threads
-    search_timeout: int = 20         # seconds per HTTP call
+    search_timeout: int = 20         # seconds per HTTP call, for a source not listed below
+    # seconds per HTTP call, per source: Tavily's advanced search with page content is the slowest
+    source_timeouts: dict = field(default_factory=lambda: {"web": 30, "news": 30, "arxiv": 20, "edgar": 20})
     search_retries: int = 2
     enabled_sources: tuple = field(default_factory=lambda: SOURCE_TYPES)
 
     @property
     def stale_before_year(self) -> int:
         return datetime.now().year - self.stale_years
+
+    def timeout(self, source: str) -> int:
+        return self.source_timeouts.get(source, self.search_timeout)
 
 
 def env(name: str, required: bool = True, default: str | None = None) -> str | None:

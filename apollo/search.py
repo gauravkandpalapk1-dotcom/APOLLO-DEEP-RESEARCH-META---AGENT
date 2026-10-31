@@ -64,6 +64,11 @@ class SearchError(Exception):
     pass
 
 
+class SourceUnavailable(SearchError):
+    """A whole source is unusable for now (no key, a rejected key, credits used up, a missing User-Agent):
+    every search to it fails the same way. The message names the problem and what to check, never a key."""
+
+
 def _retry(fn, limits: Limits):
     last = None
     for attempt in range(limits.search_retries + 1):
@@ -86,14 +91,19 @@ def strip_html(raw: str) -> str:
 
 # ---------- Tavily: general web and news, with key rotation ----------
 _tavily_lock = threading.Lock()
-_tavily_state = {"current": 0, "dead": set(), "cooldown": {}}
+_tavily_state = {"current": 0, "dead": set(), "cooldown": {}, "reasons": {}}
+TAVILY_PROBLEMS = {401: "was rejected (HTTP 401): the key is wrong or revoked",
+                   403: "was refused (HTTP 403): the key may be disabled",
+                   429: "is rate-limited (HTTP 429)",
+                   432: "is out of credits for its plan (HTTP 432)",
+                   433: "is over its pay-as-you-go limit (HTTP 433)"}
 
 
 def tavily_keys() -> list[str]:
     raw = env("TAVILY_API_KEYS", required=False) or env("TAVILY_API_KEY", required=False) or ""
     keys = [k.strip() for k in raw.split(",") if k.strip()]
     if not keys:
-        raise SearchError("No Tavily key: set TAVILY_API_KEYS in .env")
+        raise SourceUnavailable("Tavily has no key: set TAVILY_API_KEYS in .env")
     return keys
 
 
@@ -103,7 +113,7 @@ def _tavily_once(key: str, query: str, limits: Limits, topic: str) -> dict:
         headers={"Authorization": f"Bearer {key}"},
         json={"api_key": key, "query": query, "topic": topic, "max_results": limits.results_per_query,
               "include_raw_content": True, "search_depth": "advanced"},
-        timeout=limits.search_timeout,
+        timeout=limits.timeout("news" if topic == "news" else "web"),
     )
     r.raise_for_status()
     return r.json()
@@ -111,7 +121,7 @@ def _tavily_once(key: str, query: str, limits: Limits, topic: str) -> dict:
 
 def tavily(query: str, limits: Limits, topic: str = "general") -> list[Doc]:
     keys = tavily_keys()
-    errors = []
+    reasons = _tavily_state.setdefault("reasons", {})
     for _ in range(len(keys) * 2):
         now = time.time()
         with _tavily_lock:
@@ -134,11 +144,12 @@ def tavily(query: str, limits: Limits, topic: str = "general") -> list[Doc]:
                     _tavily_state["cooldown"][i] = time.time() + 60
                 else:
                     raise                                     # network or other error: a failed search
+                reasons[i] = TAVILY_PROBLEMS.get(code, "hit a usage limit")
                 _tavily_state["current"] = (i + 1) % len(keys)
-            errors.append(f"Tavily key #{i + 1}: {msg[:80]}")
             continue
         with _tavily_lock:
             _tavily_state["current"] = i
+            reasons.pop(i, None)
         docs = []
         for item in data.get("results", []):
             text = (item.get("raw_content") or item.get("content") or "").strip()
@@ -146,16 +157,23 @@ def tavily(query: str, limits: Limits, topic: str = "general") -> list[Doc]:
                 docs.append(Doc(item.get("title") or item["url"], item["url"], text[:20000],
                                 "news" if topic == "news" else "web", item.get("published_date")))
         return docs
-    raise SearchError("All Tavily keys failed: " + "; ".join(errors or ["every key is dead or cooling down"]))
+    details = "; ".join(f"key #{i + 1} {r}" for i, r in sorted(reasons.items()) if i < len(keys))
+    raise SourceUnavailable(f"Tavily is unavailable: {details or 'every key is cooling down'}. "
+                            f"Check TAVILY_API_KEYS in .env and your Tavily usage.")
 
 
 # ---------- arXiv: research papers (abstracts) ----------
 def arxiv(query: str, limits: Limits) -> list[Doc]:
+    """Paper abstracts. No match is an empty list (a normal "no results"), not an error."""
+    terms = re.sub(r"[^\w\s.-]", " ", query).split()      # quotes, colons, brackets break arXiv's query syntax
+    if not terms:
+        return []
+
     def call():
         r = requests.get("https://export.arxiv.org/api/query",
-                         params={"search_query": f"all:{query}", "max_results": limits.results_per_query,
+                         params={"search_query": "all:" + " ".join(terms), "max_results": limits.results_per_query,
                                  "sortBy": "relevance"},
-                         timeout=limits.search_timeout)
+                         timeout=limits.timeout("arxiv"))
         r.raise_for_status()
         return ET.fromstring(r.text)
 
@@ -166,6 +184,8 @@ def arxiv(query: str, limits: Limits) -> list[Doc]:
         title = " ".join((e.findtext("a:title", "", ns)).split())
         summary = " ".join((e.findtext("a:summary", "", ns)).split())
         url = e.findtext("a:id", "", ns)
+        if "/api/errors" in url:                          # arXiv reports a bad query as an "error" entry
+            raise SearchError(f"arXiv rejected the query: {summary[:150] or 'no reason given'}")
         if url and summary:
             docs.append(Doc(title, url, f"{title}. {summary}", "arxiv", e.findtext("a:published", None, ns)))
     return docs
@@ -173,17 +193,28 @@ def arxiv(query: str, limits: Limits) -> list[Doc]:
 
 # ---------- SEC EDGAR full-text search: company filings ----------
 def edgar(query: str, limits: Limits) -> list[Doc]:
+    """US company filings. A topic with no US filings gives an empty list (a normal "no results")."""
     # SEC requires a User-Agent with contact details: "Name email@example.com"
-    headers = {"User-Agent": env("SEC_USER_AGENT")}
+    agent = (env("SEC_USER_AGENT", required=False) or "").strip()
+    if not agent or "example.com" in agent or agent.lower().startswith("your name"):
+        raise SourceUnavailable("SEC EDGAR needs SEC_USER_AGENT in .env set to your name and email "
+                                "(it is missing or still the example value)")
+    headers = {"User-Agent": agent}
 
     def call():
         r = requests.get("https://efts.sec.gov/LATEST/search-index",
                          params={"q": query, "forms": "10-K,10-Q,8-K"}, headers=headers,
-                         timeout=limits.search_timeout)
+                         timeout=limits.timeout("edgar"))
         r.raise_for_status()
         return r.json()
 
-    hits = _retry(call, limits).get("hits", {}).get("hits", [])[:3]
+    try:
+        found = _retry(call, limits)
+    except SearchError as e:
+        if re.search(r"\b403\b", str(e)):
+            raise SourceUnavailable("SEC EDGAR refused the request (HTTP 403): check SEC_USER_AGENT in .env") from e
+        raise
+    hits = ((found.get("hits") or {}).get("hits") or [])[:3] if isinstance(found, dict) else []
     terms = [t.lower() for t in re.findall(r"\w{4,}", query)]
     docs = []
     for h in hits:
@@ -195,7 +226,7 @@ def edgar(query: str, limits: Limits) -> list[Doc]:
             continue
         url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{adsh.replace('-', '')}/{filename}"
         try:
-            page = _retry(lambda: requests.get(url, headers=headers, timeout=limits.search_timeout), limits)
+            page = _retry(lambda: requests.get(url, headers=headers, timeout=limits.timeout("edgar")), limits)
             text = strip_html(page.text)
         except SearchError:
             continue
