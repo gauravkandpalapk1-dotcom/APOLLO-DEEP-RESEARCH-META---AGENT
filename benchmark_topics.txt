@@ -1,0 +1,7 @@
+# One topic per line. Lines starting with # are ignored.
+# Mix of policy, technology, health and economics topics so the benchmark is not tuned to one kind of question.
+Impact of AI on Indian agriculture
+Electric vehicle adoption in India
+Microplastics in drinking water
+Groundwater depletion in North India
+Rooftop solar adoption in Indian cities
