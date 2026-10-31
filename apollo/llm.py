@@ -3,6 +3,8 @@
 Every role (strong / fast) has a chain of provider:model entries from .env, tried in order.
 Each entry is tried with each of its provider's keys. On failure the client moves on:
   - 401/403 (bad key)            -> that key is dead for this run
+  - 413, or 429 "request too large" -> that provider:model is skipped for requests this big or bigger
+                                    (prompt plus max_tokens); the key does not cool down
   - 429/5xx/timeout/connection   -> that key cools down; try the next candidate
   - 404 / model not found        -> that provider:model entry is dead for this run
   - 400 about response_format    -> retry the same candidate without JSON mode
@@ -121,12 +123,14 @@ def parse_chain(raw: str, providers: dict) -> tuple[list[tuple[str, str]], list[
 
 
 def classify_error(e: Exception) -> str:
-    """auth | retry | model | json_mode | params | other"""
+    """auth | too_large | retry | model | json_mode | params | other"""
     status = getattr(e, "status_code", None)
     msg = str(e).lower()
     name = type(e).__name__.lower()
     if status in (401, 403) or "invalid api key" in msg or "unauthorized" in msg:
         return "auth"
+    if status == 413 or (status == 429 and "request too large" in msg):   # Groq: bigger than its tokens per minute
+        return "too_large"
     if status in RETRYABLE or "timeout" in name or "connection" in name or "rate limit" in msg:
         return "retry"
     if status == 404 or ("model" in msg and ("not found" in msg or "does not exist" in msg)):
@@ -174,6 +178,7 @@ class LLM:
         self._cooldown: dict[tuple[str, int], float] = {}
         self._no_json_mode: set[tuple[str, str]] = set()
         self._no_thinking_switch: set[tuple[str, str]] = set()
+        self._too_large: dict[tuple[str, str], int] = {}   # (provider, model) -> smallest request size it refused
         self._sticky: dict[str, Candidate] = {}
         self.usage = {r: _counter() for r in ("strong", "fast")}       # per role
         self.usage_by_model: dict[str, dict] = {}                       # per "provider:model"
@@ -250,10 +255,13 @@ class LLM:
                     "switches": self.switches, "warnings": list(self.warnings)}
 
     # ---------- calls ----------
-    def _request(self, c: Candidate, system: str, user: str, json_mode: bool, temperature: float):
+    def _request(self, c: Candidate, system: str, user: str, json_mode: bool, temperature: float,
+                 max_tokens: int | None = None):
         kwargs = dict(model=c.model, temperature=temperature,
                       timeout=LLM_TIMEOUTS.get(c.provider, LLM_TIMEOUTS["default"]),
                       messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
+        if max_tokens:
+            kwargs["max_tokens"] = max_tokens
         if json_mode and (c.provider, c.model) not in self._no_json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         if DISABLE_THINKING and (c.provider, c.model) not in self._no_thinking_switch:
@@ -263,11 +271,16 @@ class LLM:
                     break
         return self._client(c).chat.completions.create(**kwargs)
 
+    def _fits(self, c: Candidate, size: int) -> bool:
+        """False if this provider:model already refused a request this size or larger as too large."""
+        return size < self._too_large.get((c.provider, c.model), float("inf"))
+
     def chat(self, system: str, user: str, json_mode: bool = False, temperature: float = 0.2,
-             role: str = "strong") -> str:
+             role: str = "strong", max_tokens: int | None = None) -> str:
         if self.budget.exceeded:
             raise BudgetExceeded(f"Token budget of {self.budget.limit} used up")
         role = role if role in self.chains else "strong"
+        size = (len(system) + len(user)) // 4 + (max_tokens or 0)   # rough tokens: prompt (4 chars each) + reply cap
         failures: list[str] = []
         waited = False
         with self._sem:
@@ -279,7 +292,7 @@ class LLM:
                     if sticky in cands:  # start from the last candidate that worked
                         i = cands.index(sticky)
                         cands = cands[i:] + cands[:i]
-                    usable = [c for c in cands if self._usable(c, now)]
+                    usable = [c for c in cands if self._usable(c, now) and self._fits(c, size)]
                 if not usable:
                     cooling = [t for (p, k), t in self._cooldown.items() if t > now]
                     if cooling and not waited and min(cooling) - now <= 15:
@@ -290,19 +303,19 @@ class LLM:
                                              "every key is dead or cooling down"))
                 for c in usable:
                     with self._lock:
-                        if not self._usable(c, time.time()):  # state may have changed (dead model)
+                        if not (self._usable(c, time.time()) and self._fits(c, size)):   # state may have changed
                             continue
-                    text = self._try(c, role, system, user, json_mode, temperature, failures)
+                    text = self._try(c, role, system, user, json_mode, temperature, failures, max_tokens, size)
                     if text is not None:
                         return text
                 if waited:
                     raise AllProvidersFailed(f"All {role} models failed: " + "; ".join(failures))
                 waited = True  # one more pass after cool-downs, then give up
 
-    def _try(self, c, role, system, user, json_mode, temperature, failures) -> str | None:
+    def _try(self, c, role, system, user, json_mode, temperature, failures, max_tokens=None, size=0) -> str | None:
         for _attempt in range(3):  # retries only for json_mode / params downgrades
             try:
-                resp = self._request(c, system, user, json_mode, temperature)
+                resp = self._request(c, system, user, json_mode, temperature, max_tokens)
             except Exception as e:  # classify every provider error; never crash the run
                 kind = classify_error(e)
                 short = f"{c.label}: {kind} ({self._redact(str(e))[:80]})"
@@ -323,6 +336,9 @@ class LLM:
                         self._dead_models.add((c.provider, c.model))
                     elif kind == "retry":
                         self._cooldown[(c.provider, c.key_index)] = time.time() + min(retry_after(e) or 60, 120)
+                    elif kind == "too_large":       # this model can't take requests this big; the key is fine
+                        key = (c.provider, c.model)
+                        self._too_large[key] = min(self._too_large.get(key, size), size)
                     self.switches += 1
                 self._note(f"{role}: {c.label} failed ({kind}); trying the next model or key")
                 return None

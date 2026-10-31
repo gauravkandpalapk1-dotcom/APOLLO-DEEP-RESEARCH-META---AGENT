@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from urllib.parse import unquote, urlsplit
 
 from .agents import status_counts
-from .config import CHUNK_DATA_RULE
+from .config import CHUNK_DATA_RULE, MAX_TOKENS
 from .llm import LLM, AllProvidersFailed, BudgetExceeded
 from .state import Chunk, RunState, Section, tokens
 
@@ -87,7 +87,7 @@ Evidence:
 
 Write 2 to 4 paragraphs of markdown prose with no headings.
 {WRITING_RULES}"""
-    return llm.chat(WRITER_SYSTEM, user, temperature=0.3, role="strong"), chunks
+    return llm.chat(WRITER_SYSTEM, user, temperature=0.3, role="strong", max_tokens=MAX_TOKENS["write"]), chunks
 
 
 # Shared by the section writers and the single-shot baseline, so both are held to the same citation standard.
@@ -178,7 +178,8 @@ def _check(entries: list, size: int, allowed: dict[str, Chunk], llm: LLM, proble
         try:
             res = llm.json(VERIFY_SYSTEM, "\n\n".join(items) +
                            '\n\nFor each item, is every fact in the sentence stated in its sources?\n'
-                           'JSON: {"results": [{"i": 0, "supported": true, "reason": "short"}]}', role="fast")
+                           'JSON: {"results": [{"i": 0, "supported": true, "reason": "short"}]}', role="fast",
+                           max_tokens=MAX_TOKENS["verify"])
             results = res.get("results") if isinstance(res, dict) else None
             if not isinstance(results, list) and isinstance(res, dict):   # bare verdicts, one object per sentence
                 results = [r for r in [res, *res.pop("_more_objects", [])] if isinstance(r, dict) and "i" in r]
@@ -277,7 +278,7 @@ e.g. [C3]: an overview or summary sentence cites the body sentences it summarise
 cannot cite this way, including a general opening line; uncited sentences are deleted in verification. Only a
 sentence saying the sources did not cover something needs no citation.
 Do not state anything the body does not state.
-JSON: {{"introduction": "...", "conclusion": "..."}}""", role="strong")
+JSON: {{"introduction": "...", "conclusion": "..."}}""", role="strong", max_tokens=MAX_TOKENS["assemble"])
     return str(res.get("introduction", "")), str(res.get("conclusion", ""))
 
 

@@ -4,7 +4,7 @@ import sys
 import time
 
 from apollo import search
-from apollo.config import DISABLE_THINKING, LLM_TIMEOUTS, THINKING_OFF, Limits
+from apollo.config import DISABLE_THINKING, LLM_TIMEOUTS, MAX_TOKENS, THINKING_OFF, Limits
 from apollo.llm import LLM, Budget, classify_error
 
 
@@ -26,6 +26,7 @@ def probe(llm: LLM, c) -> dict:
     start = time.time()
     for json_mode, use_switch in attempts:
         kwargs = dict(model=c.model, temperature=0, timeout=LLM_TIMEOUTS.get(c.provider, LLM_TIMEOUTS["default"]),
+                      max_tokens=MAX_TOKENS["verify"],      # a realistic reply cap, as Apollo's smallest call uses
                       messages=[{"role": "system", "content": "Reply with JSON only."},
                                 {"role": "user", "content": 'Return exactly {"ok": true}'}])
         if json_mode:

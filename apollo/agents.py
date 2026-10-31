@@ -4,7 +4,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-from .config import CHUNK_DATA_RULE, Limits
+from .config import CHUNK_DATA_RULE, MAX_TOKENS, Limits
 from .llm import LLM
 from .search import SourceUnavailable, run_search
 from .state import STOP, Chunk, Plan, RunState, Section, SubQ, chunk_text, domain_of, relevance
@@ -49,7 +49,8 @@ JSON shape:
     last_err = None
     for _ in range(2):
         try:
-            return validate_plan(topic, llm.json(PLAN_SYSTEM, user, temperature=0.3, role="strong"), limits)
+            raw = llm.json(PLAN_SYSTEM, user, temperature=0.3, role="strong", max_tokens=MAX_TOKENS["plan"])
+            return validate_plan(topic, raw, limits)
         except (PlanError, ValueError, KeyError, TypeError) as e:
             last_err = e
     raise PlanError(f"Could not get a usable plan: {last_err}")
@@ -303,7 +304,7 @@ that give different values for the same thing, e.g. one chunk says a market was 
 another says $7.8 billion for 2024. Also list other incompatible facts about the same thing. List only real
 conflicts: if the chunks merely differ in detail, or describe different places, years or products, leave it out.
 Write each description as one plain sentence under 250 characters."""
-    return llm.json(REVIEW_SYSTEM, user, role="fast")
+    return llm.json(REVIEW_SYSTEM, user, role="fast", max_tokens=MAX_TOKENS["review"])
 
 
 def hermes(state: RunState, llm: LLM):

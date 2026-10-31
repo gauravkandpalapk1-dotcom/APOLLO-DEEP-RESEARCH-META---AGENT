@@ -132,6 +132,46 @@ def test_reply_without_a_message_moves_to_the_next_model():
     assert llm.chat("s", "u") == "fine" and llm.active["strong"].startswith("gemini:")
 
 
+def test_max_tokens_reaches_the_request():
+    sent = []
+
+    def b(p, k, m, kw):
+        sent.append(kw.get("max_tokens"))
+        return '{"ok": true}'
+    llm, _ = make(b)
+    llm.chat("s", "u", max_tokens=1234)
+    llm.json("s", "u", role="fast", max_tokens=500)
+    llm.chat("s", "u")
+    assert sent == [1234, 500, None], sent                      # no cap given: the field is left out
+
+
+def test_request_too_large_skips_the_model_not_the_key():
+    from apollo.llm import classify_error
+    too_large = FakeError(429, "Request too large for model `nvidia/nemotron-ultra` on tokens per minute (TPM): "
+                               "Limit 6000, Requested 9000")
+    assert classify_error(too_large) == "too_large" and classify_error(FakeError(413, "payload")) == "too_large"
+    assert classify_error(FakeError(429, "rate limit reached")) == "retry"
+
+    def b(p, k, m, kw):
+        if m == "nvidia/nemotron-ultra" and kw["max_tokens"] >= 4000:
+            raise too_large
+        return f"{m} answered"
+    llm, log = make(b)
+    assert llm.chat("s", "u", max_tokens=5000) == "deepseek-ai/deepseek-v4-pro answered"
+    assert [(k, m) for _, k, m, _, _ in log] == [("nv-key-1", "nvidia/nemotron-ultra"),
+                                                ("nv-key-1", "deepseek-ai/deepseek-v4-pro")], log   # same key, next model
+    assert not llm._cooldown and not llm._dead_models, "no key cool-down, model not dead"
+    log.clear()
+    assert llm.chat("s", "u", max_tokens=1000) in ("nvidia/nemotron-ultra answered",
+                                                  "deepseek-ai/deepseek-v4-pro answered")
+    llm._sticky.clear()                                          # start from the top of the chain again
+    assert llm.chat("s", "u", max_tokens=1000) == "nvidia/nemotron-ultra answered", "smaller requests still use it"
+    log.clear()
+    llm._sticky.clear()
+    assert llm.chat("s", "u", max_tokens=6000) == "deepseek-ai/deepseek-v4-pro answered"
+    assert "nvidia/nemotron-ultra" not in [m for _, _, m, _, _ in log], "a bigger request skips it without trying"
+
+
 def test_parallel_calls():
     calls = {"n": 0}
     lock = threading.Lock()

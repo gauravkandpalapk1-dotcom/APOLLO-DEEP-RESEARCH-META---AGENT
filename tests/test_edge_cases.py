@@ -188,6 +188,32 @@ def test_token_budget():
     assert "The token budget ran out before the report could be written" in rep.markdown
 
 
+def test_reply_length_cap_per_call_type():
+    from apollo.config import MAX_TOKENS
+    assert MAX_TOKENS == {"plan": 2500, "write": 2000, "review": 2000, "verify": 1000, "assemble": 1500}
+
+    call_type = {"You are Apollo": "plan", "You are Hermes": "review", "You are a section writer": "write",
+                 "You check whether": "verify", "You are the editor": "assemble"}
+
+    class Recording(FakeLLM):
+        seen = {}
+
+        def note(self, system, kw):
+            name = next(t for prefix, t in call_type.items() if system.startswith(prefix))
+            self.seen.setdefault(name, set()).add(kw.get("max_tokens"))
+
+        def chat(self, system, user, json_mode=False, **kw):
+            self.note(system, kw)
+            return super().chat(system, user, json_mode, **kw)
+
+        def json(self, system, user, **kw):
+            self.note(system, kw)
+            return super().json(system, user, **kw)
+    llm = Recording()
+    _run(llm=llm)
+    assert llm.seen == {name: {MAX_TOKENS[name]} for name in call_type.values()}, llm.seen
+
+
 def test_search_call_cap():
     rep, events, lim = _run(Limits(max_search_calls=3, parallel_searches=1))
     assert rep.state.search_calls == 3 and rep.state.search_cap_hit
@@ -320,7 +346,7 @@ TESTS = (test_empty_search, test_search_that_raises, test_duplicate_urls_across_
          test_two_chunks_from_one_domain, test_contradictory_figures_from_two_domains,
          test_reply_not_json_then_json_after_repair, test_reply_never_valid_json,
          test_sentence_citing_a_chunk_that_does_not_exist, test_sentence_with_no_citation, test_round_cap,
-         test_time_cap, test_token_budget, test_search_call_cap, test_plan_with_fewer_than_two_sections,
+         test_time_cap, test_token_budget, test_reply_length_cap_per_call_type, test_search_call_cap, test_plan_with_fewer_than_two_sections,
          test_contradiction_with_odd_sq_id_does_not_crash, test_one_section_failing_keeps_the_others,
          test_limitation_sentences_without_citation_hold_no_figures, test_verifier_keeps_only_a_clear_yes,
          test_limitations_never_quote_the_reviewer, test_failed_introduction_leaves_no_error_text,
