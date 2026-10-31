@@ -77,8 +77,9 @@ def _error_of(out: Path) -> str:
     return lines[-1][:300] if lines else "unknown error"
 
 
-def run_apollo(topic: str, limits: Limits, runs_dir: Path, make_app=Apollo) -> tuple[dict, list[dict]]:
-    """Apollo through the same code path as scripts/run_topic.py; research() is only wrapped to keep the report."""
+def capture_run(topic: str, limits: Limits, runs_dir: Path, make_app=Apollo) -> dict:
+    """Apollo through the same code path as scripts/run_topic.py; research() is only wrapped to keep the report
+    and events. Returns {report (None if the run failed), events, out (run folder or None), seconds, error}."""
     started, captured = time.time(), {"events": []}
     try:
         app = make_app(limits)
@@ -94,15 +95,22 @@ def run_apollo(topic: str, limits: Limits, runs_dir: Path, make_app=Apollo) -> t
         app.research = research
         code, out = run_topic.run(topic, limits, runs_dir=runs_dir, app=app)
     except Exception as e:                         # e.g. no keys in .env: the run never started
-        return _row(topic, "apollo", status="failed", error=f"{type(e).__name__}: {e}"[:300]), []
-    seconds = round(time.time() - started, 1)
+        return {"report": None, "events": [], "out": None, "seconds": round(time.time() - started, 1),
+                "error": f"{type(e).__name__}: {e}"[:300]}
     rep = captured.get("report")
+    return {"report": rep, "events": captured["events"], "out": out, "seconds": round(time.time() - started, 1),
+            "error": _error_of(out) or ("" if rep else "no report")}
+
+
+def run_apollo(topic: str, limits: Limits, runs_dir: Path, make_app=Apollo) -> tuple[dict, list[dict]]:
+    run = capture_run(topic, limits, runs_dir, make_app)
+    rep, out, seconds = run["report"], run["out"], run["seconds"]
     if rep is None:
-        return _row(topic, "apollo", status="failed", error=_error_of(out) or "no report", run_dir=str(out)), []
+        return _row(topic, "apollo", status="failed", error=run["error"], run_dir=str(out or "")), []
     kept, drafted, unverified = claim_counts(rep.sentences)
     final = {q: sq.status for q, sq in rep.state.plan.subqs.items()}
-    found, closed = gap_counts(captured["events"], final)
-    row = _row(topic, "apollo", status="ok", error=_error_of(out), kept_claims=kept, drafted_claims=drafted,
+    found, closed = gap_counts(run["events"], final)
+    row = _row(topic, "apollo", status="ok", error=run["error"], kept_claims=kept, drafted_claims=drafted,
                supported_claim_rate=round(kept / drafted, 3) if drafted else "", unverified_removed=unverified,
                domains_cited=len({domain_of(r["url"]) for r in rep.references}),
                subqs_covered=sum(s == "covered" for s in final.values()), subqs_planned=len(final),

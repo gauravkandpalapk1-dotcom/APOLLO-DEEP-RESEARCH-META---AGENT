@@ -2,7 +2,7 @@
 import sys
 
 from tests import (test_benchmark, test_criteria, test_evidence, test_list_models, test_llm_failover, test_offline,
-                   test_provenance, test_run_topic, test_sources, test_verify)
+                   test_provenance, test_run_topic, test_scout, test_sources, test_verify)
 
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
@@ -22,6 +22,8 @@ if __name__ == "__main__":
     test_benchmark.main()
     print()
     test_provenance.main()
+    print()
+    test_scout.main()
     print()
     test_run_topic.main()
     print()
