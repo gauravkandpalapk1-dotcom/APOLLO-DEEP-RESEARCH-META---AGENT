@@ -2,11 +2,14 @@
 (max 3 rounds), tabulate what happened, and recommend topics for the demo from those numbers only.
 Run: python -m scripts.scout_topics [--topics scout_topics.txt] [--sources web] [--limit N]
 
+A line in the topics file may end with "| <sources>" to use other source types for that topic only, e.g.
+    Drone-based seed sowing in Pithoragarh | web,news,arxiv,edgar
 Writes runs/scout-<timestamp>/scout.md (table + recommendations + rules), scout.csv, and each run's own folder."""
 import argparse
 import csv
 import sys
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -15,7 +18,8 @@ from apollo.pipeline import Apollo
 from scripts import run_topic
 from scripts.benchmark import capture_run, read_topics
 
-COLUMNS = ["topic", "status", "error", "rounds", "stop_reason", "gaps_found", "gaps_by_type", "gaps_closed",
+COLUMNS = ["topic", "search_sources", "status", "error", "rounds", "stop_reason", "gaps_found", "gaps_by_type",
+           "gaps_closed",
            "contradictions", "contradictions_both_cited", "unfillable", "covered", "subqs", "failed_searches",
            "sources", "domains", "areas", "area_names", "minutes", "tokens", "run_dir"]
 MIN_AREAS = 3   # "distinct areas" = distinct source classes among the sources collected
@@ -85,18 +89,19 @@ def recommend(rows: list[dict]) -> dict[str, tuple[dict | None, str]]:
 
 
 def _md(rows: list[dict], recs: dict, limits: Limits) -> str:
-    head = ["Topic", "Status", "Rounds", "Stop reason", "Gaps found (by type)", "Gaps closed",
+    head = ["Topic", "Searched", "Status", "Rounds", "Stop reason", "Gaps found (by type)", "Gaps closed",
             "Contradictions (both sides cited)", "Unfillable", "Failed searches", "Sources", "Domains", "Areas",
             "Minutes", "Tokens"]
     lines = ["# Demo topic scout", "",
-             f"{len(rows)} topic(s), sources: {', '.join(limits.enabled_sources)}, max rounds: {limits.max_rounds}, "
-             f"run {datetime.now():%Y-%m-%d %H:%M}.", "", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+             f"{len(rows)} topic(s), default sources: {', '.join(limits.enabled_sources)}, "
+             f"max rounds: {limits.max_rounds}, run {datetime.now():%Y-%m-%d %H:%M}.", "",
+             "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for r in rows:
         if r["status"] == "failed":
-            lines.append(f"| {r['topic']} | failed: {r['error']} |" + " |" * (len(head) - 2))
+            lines.append(f"| {r['topic']} | {r['search_sources']} | failed: {r['error']} |" + " |" * (len(head) - 3))
             continue
         lines.append("| " + " | ".join(str(x) for x in [
-            r["topic"], "ok", r["rounds"], r["stop_reason"], f"{r['gaps_found']} ({r['gaps_by_type'] or 'none'})",
+            r["topic"], r["search_sources"], "ok", r["rounds"], r["stop_reason"], f"{r['gaps_found']} ({r['gaps_by_type'] or 'none'})",
             r["gaps_closed"], f"{r['contradictions']} ({r['contradictions_both_cited']})", r["unfillable"],
             r["failed_searches"], r["sources"], r["domains"], f"{r['areas']} ({r['area_names']})", r["minutes"],
             r["tokens"]]) + " |")
@@ -109,13 +114,21 @@ def _md(rows: list[dict], recs: dict, limits: Limits) -> str:
     return "\n".join(lines)
 
 
+def parse_topic(line: str, default: tuple) -> tuple[str, tuple]:
+    """'Topic text | web,news,arxiv' -> ("Topic text", ("web", "news", "arxiv")); no "|" -> the default sources."""
+    topic, _, sources = line.partition("|")
+    return topic.strip(), (run_topic.parse_sources(sources) if sources.strip() else default)
+
+
 def run_scout(topics: list[str], limits: Limits, out_dir: str | Path, make_app=Apollo) -> Path:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     rows = []
-    for i, topic in enumerate(topics):
-        print(f"\n===== [{i + 1}/{len(topics)}] {topic}", flush=True)
-        rows.append(scout_row(topic, capture_run(topic, limits, out / "runs", make_app)))
+    for i, line in enumerate(topics):
+        topic, sources = parse_topic(line, limits.enabled_sources)
+        print(f"\n===== [{i + 1}/{len(topics)}] {topic} (sources: {', '.join(sources)})", flush=True)
+        run = capture_run(topic, replace(limits, enabled_sources=sources), out / "runs", make_app)
+        rows.append({**scout_row(topic, run), "search_sources": ",".join(sources)})
         print(f"===== {rows[-1]['status']}" + (f" ({rows[-1]['error']})" if rows[-1]["status"] == "failed" else ""),
               flush=True)
     with open(out / "scout.csv", "w", newline="", encoding="utf-8") as f:
@@ -137,7 +150,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=0, help="only the first N topics")
     args = p.parse_args(argv)
     if not Path(args.topics).exists():
-        p.error(f"{args.topics} not found: write one candidate topic per line (lines starting with # are ignored)")
+        p.error(f"{args.topics} not found: write one candidate topic per line (lines starting with # are ignored; "
+                f"end a line with '| web,news,arxiv' to use other sources for that topic)")
     topics = read_topics(args.topics)[:args.limit or None]
     if not topics:
         p.error(f"no topics in {args.topics}")

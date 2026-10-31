@@ -39,9 +39,12 @@ WRITER_SYSTEM = ("You are a section writer for a research report. You write only
 
 
 def section_evidence(state: RunState, section: Section) -> list[Chunk]:
+    """Each sub-question's best chunks, only those Hermes judged relevant (all of them if it never judged)."""
     out = []
     for qid in section.subq_ids:
-        out.extend(state.top_chunks(qid, state.limits.chunks_per_sq))
+        sq = state.plan.subqs[qid]
+        only = None if sq.relevant_chunk_ids is None else set(sq.relevant_chunk_ids)
+        out.extend(state.top_chunks(qid, state.limits.chunks_per_sq, only))
     return out
 
 
@@ -290,6 +293,8 @@ def limitations(state: RunState, results: list[SectionResult], unverified: int =
         lines.append(f"- The {source} source was unavailable during this run: {problem}")
     if state.failed_searches:
         lines.append(f"- {len(state.failed_searches)} search call(s) failed or timed out and were skipped.")
+    if state.empty_searches:
+        lines.append(f"- {state.empty_searches} search call(s) returned nothing.")
     removed = sum(why != UNVERIFIED for r in results for _, why in r.removed)
     if removed:
         lines.append(f"- {removed} drafted sentence(s) were removed in verification (no valid citation, or the cited source did not support them).")

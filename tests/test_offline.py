@@ -61,6 +61,7 @@ class FakeLLM:
                 return any(s == q for _, s in chunk_sq)
 
             return {"sub_questions": [{"id": q, "answered": any(s == q for _, s in chunk_sq),
+                                       "relevant_chunk_ids": [c for c, s in chunk_sq if s == q],   # all shown help
                                        "criteria_met": {**{cid: met(q, text) for s, cid, text in criteria if s == q},
                                                         "c9": True},          # an id Hermes invented: ignored
                                        "missing": "", "follow_up_query": f"{q} better query"} for q in sqs],

@@ -44,11 +44,19 @@ def test_no_topic_fits_is_said_not_guessed():
         assert chosen is None and why.startswith("No topic fits"), (role, why)
 
 
+def test_parse_topic_sources():
+    default = ("web", "news")
+    assert scout_topics.parse_topic("Number of EV chargers in India", default) == ("Number of EV chargers in India",
+                                                                                  default)
+    assert scout_topics.parse_topic("Drone sowing in Pithoragarh | web,news,arxiv,edgar", default) == \
+        ("Drone sowing in Pithoragarh", ("web", "news", "arxiv", "edgar"))
+
+
 def test_scout_end_to_end_with_a_failed_topic():
     agents.run_search = fake_search
     llms = iter([FakeLLM(), PlanFailsLLM()])
     with tempfile.TemporaryDirectory() as tmp:
-        out = scout_topics.run_scout(["Impact of AI on Indian agriculture", "a topic that fails"],
+        out = scout_topics.run_scout(["Impact of AI on Indian agriculture", "a topic that fails | web"],
                                      Limits(max_rounds=3, parallel_searches=2), Path(tmp) / "scout",
                                      make_app=lambda limits: Apollo(limits, llm=next(llms)))
         rows = list(csv.DictReader(open(out / "scout.csv", encoding="utf-8")))
@@ -58,8 +66,10 @@ def test_scout_end_to_end_with_a_failed_topic():
         assert int(ok["contradictions"]) >= 1 and ok["failed_searches"] != "0" and int(ok["domains"]) > 1
         assert ok["areas"] == "1" and ok["area_names"] == "other"       # fake domains are all .example
         assert failed["status"] == "failed" and "AllProvidersFailed" in failed["error"] and failed["rounds"] == ""
+        assert failed["topic"] == "a topic that fails" and failed["search_sources"] == "web"   # per-topic sources
+        assert ok["search_sources"] == "web,news,arxiv,edgar"                                 # the default
         md = (out / "scout.md").read_text(encoding="utf-8")
-        assert "| Impact of AI on Indian agriculture | ok | 2 |" in md and "failed: " in md
+        assert "| Impact of AI on Indian agriculture | web,news,arxiv,edgar | ok | 2 |" in md and "failed: " in md
         assert "**Best two-round topic:** No topic fits" in md          # only 1 area in the fake run
         assert "**Best failure topic:** Impact of AI on Indian agriculture" in md
         assert "## Rules" in md
@@ -68,7 +78,7 @@ def test_scout_end_to_end_with_a_failed_topic():
 def main():
     if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    for t in (test_recommendations_follow_the_rules, test_no_topic_fits_is_said_not_guessed,
+    for t in (test_recommendations_follow_the_rules, test_no_topic_fits_is_said_not_guessed, test_parse_topic_sources,
               test_scout_end_to_end_with_a_failed_topic):
         t()
         print("ok  ", t.__name__)

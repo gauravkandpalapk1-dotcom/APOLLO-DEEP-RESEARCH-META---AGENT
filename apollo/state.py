@@ -65,6 +65,7 @@ class SubQ:
     acceptance_criteria: list[dict] = field(default_factory=list)  # 0 to 3 {"id": "c1", "text": ...} checkable statements
     criteria_met: dict[str, bool] = field(default_factory=dict)    # Hermes' latest verdict per criterion id
     added_in_round: int = 1
+    relevant_chunk_ids: list[str] | None = None   # chunks Hermes judged to help answer it; None = not judged yet
 
 
 @dataclass
@@ -126,6 +127,7 @@ class RunState:
     contradictions: list[dict] = field(default_factory=list)
     failed_searches: list[dict] = field(default_factory=list)
     unavailable_sources: dict[str, str] = field(default_factory=dict)   # source type -> what is wrong (bad key, quota)
+    empty_searches: int = 0                                              # searches that returned nothing
     new_sources_this_round: int = 0
     new_domains_this_round: int = 0                   # new (sub-question, domain) pairs found this round
     search_calls: int = 0                             # search API calls dispatched so far (capped by Limits)
@@ -151,9 +153,18 @@ class RunState:
     def chunks_for(self, sq_id: str) -> list[Chunk]:
         return [c for c in self.chunks.values() if c.sq_id == sq_id]
 
-    def top_chunks(self, sq_id: str, n: int) -> list[Chunk]:
-        """Best chunks for a sub-question, one per URL first so evidence is diverse."""
-        ranked = sorted(self.chunks_for(sq_id), key=lambda c: c.score, reverse=True)
+    def usable_chunks(self, sq: SubQ) -> list[Chunk]:
+        """A sub-question's evidence: the chunks Hermes judged relevant, or all of them if it has not judged yet."""
+        chunks = self.chunks_for(sq.id)
+        if sq.relevant_chunk_ids is None:
+            return chunks
+        relevant = set(sq.relevant_chunk_ids)
+        return [c for c in chunks if c.id in relevant]
+
+    def top_chunks(self, sq_id: str, n: int, only: set[str] | None = None) -> list[Chunk]:
+        """Best chunks for a sub-question, one per URL first so evidence is diverse; only those ids if given."""
+        ranked = sorted((c for c in self.chunks_for(sq_id) if only is None or c.id in only),
+                        key=lambda c: c.score, reverse=True)
         picked, urls = [], set()
         for c in ranked:
             if c.url not in urls:

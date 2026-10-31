@@ -7,7 +7,7 @@ from datetime import datetime
 from .config import CHUNK_DATA_RULE, Limits
 from .llm import LLM
 from .search import SourceUnavailable, run_search
-from .state import Chunk, Plan, RunState, Section, SubQ, chunk_text, domain_of, relevance
+from .state import STOP, Chunk, Plan, RunState, Section, SubQ, chunk_text, domain_of, relevance
 
 
 class PlanError(Exception):
@@ -222,8 +222,9 @@ def athena(state: RunState, jobs: list[tuple[SubQ, str]]):
                 continue
             added = _store_docs(state, sq, docs)
             kind = "search" if docs else "search_fail"
+            state.empty_searches += not docs
             msg = (f"[{st}] {sq.id} '{q}' → {len(docs)} results, {added} new sources"
-                   if docs else f"[{st}] {sq.id} '{q}' → no results")
+                   if docs else f"[{st}] {sq.id} '{q}' → no results: the search returned nothing")
             yield state.event(kind, msg, {"sq": sq.id, "query": q, "source": st,
                                           "urls": [d.url for d in docs]})
     state.new_domains_this_round = len({(c.sq_id, c.domain) for c in state.chunks.values()} - domains_before)
@@ -276,17 +277,22 @@ acceptance criteria (the <criterion> lines) holds, judged only from the chunks s
 {evidence}
 
 Return JSON:
-{{"sub_questions": [{{"id": "q1", "answered": true, "criteria_met": {{"c1": true, "c2": false}},
+{{"sub_questions": [{{"id": "q1", "answered": true, "relevant_chunk_ids": ["C3", "C9"],
+   "criteria_met": {{"c1": true, "c2": false}},
    "missing": "what is still missing; empty if nothing",
    "follow_up_query": "short web search query that would fill the gap, empty if answered and every criterion is met"}}],
  "claims": [{{"chunk_id": "C3", "sq_id": "q1", "entity": "...", "metric": "...", "value": "12.5", "unit": "%", "as_of_year": 2024}}],
  "source_years": {{"C3": 2023}},
  "contradictions": [{{"sq_id": "q1", "chunk_ids": ["C3", "C9"], "description": "...", "follow_up_query": "..."}}]}}
 
-Rules: "criteria_met" is keyed by the id of each <criterion> line of that sub-question ({{}} if it has none).
+Rules: "relevant_chunk_ids" lists the chunks shown for that sub-question that actually help answer it; [] if none
+do (a chunk on a different place, product or topic does not count).
+"criteria_met" is keyed by the id of each <criterion> line of that sub-question ({{}} if it has none).
 "claims" lists only quantitative facts stated in a chunk (at most 5 per sub-question).
 "source_years" gives the year a chunk's information refers to, only when the chunk states it.
-"contradictions" lists chunks that state incompatible facts about the same thing."""
+"contradictions": look actively for figures that conflict between sources. List two chunks from different websites
+that give different values for the same thing, e.g. one chunk says a market was worth $4.2 billion in 2024 and
+another says $7.8 billion for 2024. Also list other incompatible facts about the same thing."""
     return llm.json(REVIEW_SYSTEM, user, role="fast")
 
 
@@ -340,6 +346,7 @@ def _apply_review(state: RunState, sqs: list[SubQ], review: dict) -> int:
             sq.missing = str(item.get("missing") or "")[:300]
             sq.follow_up = str(item.get("follow_up_query") or "")[:200]
             sq.criteria_met = _criteria_verdicts(sq, item.get("criteria_met"))
+            _apply_relevance(state, sq, item.get("relevant_chunk_ids"))
     # dates: only fill where the search API gave none, and only for chunks that exist
     years = review.get("source_years")
     for cid, year in (years.items() if isinstance(years, dict) else []):
@@ -355,14 +362,26 @@ def _apply_review(state: RunState, sqs: list[SubQ], review: dict) -> int:
     for con in _objects(review.get("contradictions")):
         chunk_ids = con.get("chunk_ids")
         cids = [x for x in (chunk_ids if isinstance(chunk_ids, list) else []) if str(x) in state.chunks]
-        urls = {state.chunks[x].url for x in cids}
-        if len(cids) >= 2 and len(urls) >= 2 and con.get("sq_id") in ids:
+        domains = {state.chunks[x].domain for x in cids}
+        if len(cids) >= 2 and len(domains) >= 2 and con.get("sq_id") in ids:   # one site disagreeing with itself isn't
             if not any(set(cids) == set(x["chunk_ids"]) for x in state.contradictions):
                 state.contradictions.append({"sq_id": con["sq_id"], "chunk_ids": cids,
                                              "description": str(con.get("description", ""))[:300],
                                              "follow_up_query": str(con.get("follow_up_query", ""))[:200],
                                              "chased": False, "found_by": "hermes"})
     return skipped
+
+
+def _apply_relevance(state: RunState, sq: SubQ, raw):
+    """Store which chunks help answer the sub-question. Hermes only saw the top chunks, so its verdict replaces the
+    old one for those and earlier verdicts on chunks it did not see are kept. Unknown ids are ignored; a reply
+    without a list leaves the sub-question as it was."""
+    if not isinstance(raw, list):
+        return
+    shown = {c.id for c in state.top_chunks(sq.id, state.limits.chunks_per_sq)}
+    judged = {str(x).strip() for x in raw} & shown
+    kept = set(sq.relevant_chunk_ids or []) - shown
+    sq.relevant_chunk_ids = [c.id for c in state.chunks_for(sq.id) if c.id in judged | kept]
 
 
 def _objects(raw) -> list[dict]:
@@ -384,33 +403,90 @@ def _criteria_verdicts(sq: SubQ, raw) -> dict[str, bool]:
     return out
 
 
-def _num(v) -> float | None:
-    m = re.search(r"-?\d+(?:\.\d+)?", str(v).replace(",", ""))
-    return float(m.group()) if m else None
+def norm_words(text) -> list[str]:
+    """Lowercase words without punctuation, possessives, single letters and stopwords; simple plurals made singular
+    ("India's public EV charging stations" -> ["india", "public", "ev", "charging", "station"])."""
+    out = []
+    for w in re.findall(r"[a-z0-9]+", re.sub(r"['’]s\b", "", str(text).lower())):
+        if w in STOP or len(w) < 2:
+            continue
+        if len(w) > 4 and w.endswith("ies"):
+            w = w[:-3] + "y"
+        elif len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+            w = w[:-1]
+        out.append(w)
+    return out
+
+
+SCALE = {"million": 1e6, "mn": 1e6, "m": 1e6, "billion": 1e9, "bn": 1e9, "b": 1e9, "crore": 1e7, "lakh": 1e5,
+         "lac": 1e5}
+CURRENCY = {"$": "usd", "us$": "usd", "usd": "usd", "dollar": "usd", "₹": "inr", "rs": "inr", "inr": "inr",
+            "rupee": "inr"}
+PERCENT = {"%", "percent", "pct"}
+
+
+def quantity(value, unit) -> tuple[float, str] | None:
+    """(number in base units, kind) from a claim's value and unit, e.g. ("4.5", "billion USD") -> (4.5e9, "usd"),
+    ("500", "crore") -> (5e9, "count:"), ("12", "percent") -> (12.0, "%"). Kind is the currency, "%", or the
+    remaining unit words; only claims of the same kind are compared. None when there is no number."""
+    text = f"{value} {unit}".lower().replace(",", "")
+    num = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not num:
+        return None
+    tokens = re.findall(r"us\$|\$|₹|%|[a-z]+", text.replace(num.group(), " ", 1))
+    # symbols stay as they are; words lose plurals ("rupees" -> "rupee", "crores" -> "crore")
+    words = [t if not t.isalpha() else (norm_words(t) or [t])[0] for t in tokens]
+    currency = next((CURRENCY[w] for w in words if w in CURRENCY), None)
+    percent = any(w in PERCENT for w in words) or ("per" in words and "cent" in words)
+    scale = next((SCALE[w] for w in words if w in SCALE), 1.0)
+    rest = sorted({w for w in words if w.isalpha() and w not in STOP and w not in CURRENCY and w not in SCALE
+                   and w not in PERCENT and w not in ("per", "cent")})
+    kind = currency or ("%" if percent else "count:" + " ".join(rest))
+    return float(num.group()) * (1.0 if percent else scale), kind
+
+
+def _jaccard_words(a: list[str], b: list[str]) -> float:
+    sa, sb = set(a), set(b)
+    return len(sa & sb) / len(sa | sb) if sa and sb else 0.0
 
 
 def numeric_contradictions(state: RunState, tolerance: float = 0.25) -> list[dict]:
-    """Same entity + metric + unit + year from two different domains, values differing by more than 25%."""
-    groups = {}
+    """Two claims about the same thing from different domains whose values differ by more than 25%.
+    "The same thing": same sub-question, same entity after normalising, metrics with word overlap >= 0.6, the same
+    kind of unit (scale words like crore, lakh, bn and currency symbols normalised), and equal years or a year
+    missing on either side. Reports the widest such conflict once per figure."""
+    items = []
     for cl in state.claims:
-        val = _num(cl.get("value"))
-        if val is None:
+        q = quantity(cl.get("value"), cl.get("unit", ""))
+        entity, metric = " ".join(norm_words(cl.get("entity", ""))), norm_words(cl.get("metric", ""))
+        if q and entity and metric:
+            year = str(cl.get("as_of_year") or "").strip()
+            items.append({"value": q[0], "kind": q[1], "entity": entity, "metric": metric, "year": year,
+                          "domain": domain_of(cl.get("url", "")), "claim": cl})
+
+    def same_figure(a, b) -> bool:
+        return (a["claim"]["sq_id"] == b["claim"]["sq_id"] and a["entity"] == b["entity"] and a["kind"] == b["kind"]
+                and _jaccard_words(a["metric"], b["metric"]) >= 0.6
+                and (a["year"] == b["year"] or not a["year"] or not b["year"]))
+
+    pairs = []
+    for i, a in enumerate(items):
+        for b in items[i + 1:]:
+            lo, hi = sorted((a, b), key=lambda x: x["value"])
+            gap = abs(hi["value"] - lo["value"])
+            if (same_figure(a, b) and a["domain"] != b["domain"]
+                    and gap > tolerance * max(abs(hi["value"]), abs(lo["value"]), 1e-9)):
+                pairs.append((gap / max(abs(hi["value"]), 1e-9), lo, hi))
+    found, accepted = [], []
+    for _, lo, hi in sorted(pairs, key=lambda p: p[0], reverse=True):   # widest first, one per figure
+        if any(same_figure(lo, a) for a in accepted):
             continue
-        key = (cl["sq_id"], str(cl.get("entity", "")).lower().strip(), str(cl.get("metric", "")).lower().strip(),
-               str(cl.get("unit", "")).lower().strip(), str(cl.get("as_of_year", "")))
-        if key[1] and key[2]:
-            groups.setdefault(key, []).append((val, cl))
-    found = []
-    for key, items in groups.items():
-        # widest gap between two claims from different domains (one site repeating itself is not a contradiction)
-        pairs = [(a, b) for a in items for b in items if a[0] < b[0] and domain_of(a[1]["url"]) != domain_of(b[1]["url"])]
-        if not pairs:
-            continue
-        lo, hi = max(pairs, key=lambda p: p[1][0] - p[0][0])
-        if abs(hi[0] - lo[0]) > tolerance * max(abs(hi[0]), abs(lo[0]), 1e-9):
-            found.append({"sq_id": key[0], "chunk_ids": [lo[1]["chunk_id"], hi[1]["chunk_id"]],
-                          "description": f"{key[1]} {key[2]}: {lo[0]:g} vs {hi[0]:g} {key[3]}".strip(),
-                          "follow_up_query": "", "chased": False, "found_by": "code"})
+        accepted.append(lo)
+        show = lambda x: f"{x['claim'].get('value')} {x['claim'].get('unit') or ''}".strip()
+        found.append({"sq_id": lo["claim"]["sq_id"], "chunk_ids": [lo["claim"]["chunk_id"], hi["claim"]["chunk_id"]],
+                      "description": f"{lo['claim'].get('entity')} {lo['claim'].get('metric')}: "
+                                     f"{show(lo)} vs {show(hi)}",
+                      "follow_up_query": "", "chased": False, "found_by": "code"})
     return found
 
 
@@ -424,8 +500,11 @@ def route(state: RunState, budget) -> tuple[str, str, list[dict]]:
     for sq in state.plan.subqs.values():
         if sq.status != "open":
             continue
-        sq_gaps, n_domains = [], len(state.distinct_domains(sq.id))
-        if n_domains < limits.min_domains_per_sq:   # independent sources: pages on one site count once
+        usable = state.usable_chunks(sq)             # only chunks Hermes judged relevant, once it has judged
+        sq_gaps, n_domains = [], len({c.domain for c in usable})
+        if sq.relevant_chunk_ids is not None and not usable:
+            sq_gaps.append({"type": "coverage", "detail": "no relevant evidence"})
+        elif n_domains < limits.min_domains_per_sq:   # independent sources: pages on one site count once
             sq_gaps.append({"type": "coverage", "detail": f"only {n_domains} domain(s)"})
         elif not sq.answered:
             sq_gaps.append({"type": "coverage", "detail": sq.missing or "reviewer says the evidence doesn't answer it"})
@@ -487,7 +566,8 @@ def close_open(state: RunState, reason: str):
 
 
 def _close(sq: SubQ, state: RunState, reason: str):
-    sq.status = "partial" if state.chunks_for(sq.id) else "unfillable"
+    """Partial if some relevant evidence was found, unfillable if none was (no results, or only off-topic ones)."""
+    sq.status = "partial" if state.usable_chunks(sq) else "unfillable"
     sq.status_reason = reason
 
 
