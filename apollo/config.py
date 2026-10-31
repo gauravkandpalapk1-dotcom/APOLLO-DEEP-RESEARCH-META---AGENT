@@ -11,6 +11,16 @@ except ImportError:
 
 SOURCE_TYPES = ("web", "news", "arxiv", "edgar")
 
+
+def search_depth(raw: str | None) -> str:
+    """Tavily search depth: "basic" costs 1 credit per search, "advanced" costs 2 and returns more relevant
+    snippets. Anything else, or unset, means basic."""
+    value = (raw or "").strip().lower()
+    return value if value in ("basic", "advanced") else "basic"
+
+
+SEARCH_DEPTH = search_depth(os.environ.get("SEARCH_DEPTH"))
+
 # ---------- source classes (editable; matched against the domain, "www." removed) ----------
 # A suffix matches the end of the domain (".gov" matches "epa.gov"); a domain matches itself and its subdomains.
 GOVERNMENT_SUFFIXES = (".gov", ".gov.in", ".nic.in", ".gov.uk", ".gc.ca", ".europa.eu")

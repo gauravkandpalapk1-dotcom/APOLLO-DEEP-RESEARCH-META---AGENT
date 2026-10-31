@@ -123,9 +123,14 @@ def show_models():
 
 
 # ---------------- live log ----------------
+def no_latex(text: str) -> str:
+    """st.markdown reads text between two "$" signs as LaTeX, which garbles "$4.2 billion ... $7.8 billion"."""
+    return text.replace("$", "\\$")
+
+
 def log_line(e: dict):
     name, colour = ACTORS.get(e.get("actor"), ACTORS["system"])
-    text = e["text"].replace("$", "\\$")                     # "$4.2 billion" is not LaTeX
+    text = no_latex(e["text"])
     st.markdown(f":{colour}[**{name}**] {ICONS.get(e['kind'], '•')} `{e['t']:>6}s` {text}")
 
 
@@ -330,7 +335,7 @@ if rep:
     t_report, t_evidence, t_sources, t_trace, t_removed = st.tabs(
         ["Report", "Evidence", "Sources", "Trace", "Removed sentences"])
     with t_report:
-        st.markdown(rep.markdown)
+        st.markdown(no_latex(rep.markdown))
         d1, d2, d3 = st.columns(3)
         d1.download_button("Download Markdown", rep.markdown, file_name="apollo_report.md", mime="text/markdown")
         d3.download_button("Download provenance JSON",
@@ -353,20 +358,21 @@ if rep:
         shown = [x for x in sentences if pick in ("All sections", x["section"])]
         for x in (x for x in shown if x["verdict"] == "kept"):
             plain = plain_sentence(x["text_with_refs"])
-            with st.expander(f"{x['section']}: {plain[:160]}{'…' if len(plain) > 160 else ''}"):
-                st.markdown(x["text_with_refs"])
+            with st.expander(no_latex(f"{x['section']}: {plain[:160]}{'…' if len(plain) > 160 else ''}")):
+                st.markdown(no_latex(x["text_with_refs"]))
                 if not x["evidence"]:
                     st.caption(f"No cited passage: this sentence {x['reason']}.")
                 for ev in x["evidence"]:
                     ref = f"[{ev['ref_number']}] " if ev["ref_number"] else ""
                     st.markdown(f"**{ref}[{ev['title'] or ev['url']}]({ev['url']})** · {ev['domain']} · "
                                 f"{ev['published'] or 'date unknown'}")
-                    st.markdown("> " + highlight(ev["passage"], x["text_with_refs"]))
+                    st.markdown("> " + no_latex(highlight(ev["passage"], x["text_with_refs"])))
         if show_removed:
             st.subheader("Removed sentences")
             removed_rows = [x for x in shown if x["verdict"] == "removed"]
             for x in removed_rows:
-                st.markdown(f"- **{x['section']}**: {plain_sentence(x['text_with_refs'])}  \n  *Removed: {x['reason']}*")
+                st.markdown(no_latex(f"- **{x['section']}**: {plain_sentence(x['text_with_refs'])}  \n  "
+                                     f"*Removed: {x['reason']}*"))
             if not removed_rows:
                 st.write("No sentences were removed in this section.")
     with t_sources:

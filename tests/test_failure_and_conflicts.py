@@ -201,7 +201,9 @@ def test_hermes_non_conflicts_dropped_and_descriptions_readable():
     desc = state.contradictions[0]["description"]
     assert desc.startswith("q1-0.example says the subsidy is 50% while q1-2.example says 40%"), desc
     assert desc.endswith("…") and len(desc) <= agents.DESCRIPTION_CHARS + 1 and not desc[:-1].endswith(" ")
-    assert "Sources disagreed: q1-0.example says" in limitations(state, [])
+    lim = limitations(state, [])                    # Limitations uses the run's data, never the reviewer's wording
+    assert "Sources disagreed on *Question 1?*: q1-0.example, q1-2.example give different figures" in lim, lim
+    assert "subsidy" not in lim and "50%" not in lim
 
 
 def main():

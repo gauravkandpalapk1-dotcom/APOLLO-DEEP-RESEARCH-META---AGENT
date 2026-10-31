@@ -96,6 +96,35 @@ def test_plan_editor_accepts_any_source_subset():
     assert {s["source"] for s in state.search_log if s["sq"] == "q1"} == {"arxiv", "edgar"}, "no web for q1"
 
 
+def test_brief_frontend_checklist():
+    """The brief's frontend list and bonus goals, as far as a headless render can check them."""
+    from apollo.export import markdown_to_pdf
+    at = _app(review_gaps=True)
+    labels = {w.label for w in [*at.slider, *at.number_input, *at.multiselect, *at.checkbox, *at.toggle]}
+    assert {"Maximum research rounds", "Time limit for research (minutes)", "Token budget", "Source types",
+            "Let me review the plan before searching", "Review gaps between rounds"} <= labels, labels
+    assert at.text_input[0].label == "Research topic"
+    assert any(b.label == "Approve plan and start research" for b in at.button), "plan approval"
+    _click(at, "Approve plan and start research")
+    log = _markdown(at)                                         # live progress: plan, searches, reviews, gaps
+    for icon, kind in (("🗺️", "plan"), ("🔎", "search"), ("🧐", "review"), ("🕳️", "gap")):
+        assert icon in log, f"no {kind} line in the live log"
+    assert at.session_state["gap_rows"], "gap approval"
+    sources = {s["source"] for s in at.session_state["run"].search_log}
+    assert {"web", "arxiv", "edgar"} <= sources, sources       # several source types searched in one run
+    _click(at, "Write report now")
+    rep = at.session_state["report"]
+    assert [t.label for t in at.tabs] == ["Report", "Evidence", "Sources", "Trace", "Removed sentences"]
+    report = _markdown(at)
+    assert "## References" in report and "[[1]](https://" in report, "clickable citations and references"
+    src = next(d.value for d in at.dataframe if "url" in d.value.columns)
+    assert {"url", "sections", "title"} <= set(src.columns) and src["url"].str.startswith("https://").all()
+    assert any(e.label.startswith("Introduction: ") for e in at.expander), "evidence viewer per sentence"
+    downloads = [e.proto.label for e in at.get("download_button")]
+    assert downloads == ["Download Markdown", "Download PDF", "Download provenance JSON"], downloads
+    assert markdown_to_pdf(rep.markdown)[:5] == b"%PDF-"
+
+
 def test_full_run_with_the_toggle_off():
     at = _app(review_gaps=False)
     _click(at, "Approve plan and start research")
@@ -156,7 +185,7 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     try:
         for t in (test_models_panel_live_and_after_the_run, test_plan_review_shows_graph_and_editor,
-                  test_plan_editor_accepts_any_source_subset,
+                  test_plan_editor_accepts_any_source_subset, test_brief_frontend_checklist,
                   test_full_run_with_the_toggle_off,
                   test_gap_review_one_round_per_click, test_rerun_mid_round_does_not_crash):
             t()

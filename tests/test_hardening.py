@@ -89,6 +89,29 @@ def test_per_source_timeouts_reach_the_http_calls():
     assert Limits().timeout("web") == 30 and Limits().timeout("unknown") == Limits().search_timeout
 
 
+
+def test_search_depth_setting():
+    """SEARCH_DEPTH defaults to basic (1 Tavily credit per search); advanced is used only when set."""
+    from apollo import config
+    for raw, expected in ((None, "basic"), ("", "basic"), ("advanced", "advanced"), (" ADVANCED ", "advanced"),
+                          ("deep", "basic")):
+        assert config.search_depth(raw) == expected, (raw, config.search_depth(raw))
+    seen = []
+
+    def post(url, headers=None, json=None, timeout=None):
+        seen.append(json["search_depth"])
+        return Resp(200, {"results": []})
+    saved = config.SEARCH_DEPTH
+    try:
+        for depth in ("basic", "advanced"):
+            config.SEARCH_DEPTH = depth
+            _reset_tavily("k1")
+            _with("post", post, lambda: search.tavily("q", Limits(search_retries=0)))
+        assert seen == ["basic", "advanced"], seen
+    finally:
+        config.SEARCH_DEPTH = saved
+
+
 def test_arxiv_empty_error_and_query_cleanup():
     sent = []
 
@@ -152,7 +175,8 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for t in (test_tavily_problems_are_named_without_keys, test_per_source_timeouts_reach_the_http_calls,
-              test_arxiv_empty_error_and_query_cleanup, test_edgar_user_agent_and_non_us_topics,
+              test_search_depth_setting, test_arxiv_empty_error_and_query_cleanup,
+              test_edgar_user_agent_and_non_us_topics,
               test_athena_warns_once_when_a_source_is_down, test_every_writer_prompt_requires_cited_summaries):
         t()
         print("ok  ", t.__name__)

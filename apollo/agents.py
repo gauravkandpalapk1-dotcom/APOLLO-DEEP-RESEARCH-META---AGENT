@@ -352,7 +352,8 @@ def _apply_review(state: RunState, sqs: list[SubQ], review: dict) -> int:
             continue
         sq = ids.get(str(item.get("id")))
         if sq:
-            sq.answered = bool(item.get("answered"))
+            answered = item.get("answered")                   # bool("false") is True: accept only a clear yes
+            sq.answered = answered is True or (isinstance(answered, str) and answered.strip().lower() in ("true", "yes"))
             sq.missing = str(item.get("missing") or "")[:300]
             sq.follow_up = str(item.get("follow_up_query") or "")[:200]
             sq.criteria_met = _criteria_verdicts(sq, item.get("criteria_met"))
@@ -376,9 +377,10 @@ def _apply_review(state: RunState, sqs: list[SubQ], review: dict) -> int:
         description = str(con.get("description", ""))
         if NOT_A_CONFLICT.search(description):            # Hermes listed it but says itself it isn't a conflict
             continue
-        if len(cids) >= 2 and len(domains) >= 2 and con.get("sq_id") in ids:   # one site disagreeing with itself isn't
+        sq_id = str(con.get("sq_id", ""))                # a list or object here must not crash the run
+        if len(cids) >= 2 and len(domains) >= 2 and sq_id in ids:   # one site disagreeing with itself isn't
             if not any(set(cids) == set(x["chunk_ids"]) for x in state.contradictions):
-                state.contradictions.append({"sq_id": con["sq_id"], "chunk_ids": cids,
+                state.contradictions.append({"sq_id": sq_id, "chunk_ids": cids,
                                              "description": readable_description(state, description),
                                              "follow_up_query": str(con.get("follow_up_query", ""))[:200],
                                              "chased": False, "found_by": "hermes"})
@@ -539,7 +541,8 @@ def route(state: RunState, budget) -> tuple[str, str, list[dict]]:
         elif n_domains < limits.min_domains_per_sq:   # independent sources: pages on one site count once
             sq_gaps.append({"type": "coverage", "detail": f"only {n_domains} domain(s)"})
         elif not sq.answered:
-            sq_gaps.append({"type": "coverage", "detail": sq.missing or "reviewer says the evidence doesn't answer it"})
+            sq_gaps.append({"type": "coverage", "detail": sq.missing or "reviewer says the evidence doesn't answer it",
+                            "note": "the reviewer found the evidence incomplete"})
         unmet = [c for c in sq.acceptance_criteria if not sq.criteria_met.get(c["id"])]
         if unmet:
             sq_gaps.append({"type": "criteria",
@@ -549,12 +552,15 @@ def route(state: RunState, budget) -> tuple[str, str, list[dict]]:
             sq_gaps.append({"type": "stale", "detail": f"newest dated source is from {max(years)}"})
         for con in state.contradictions:
             if con["sq_id"] == sq.id and not con["chased"]:
-                sq_gaps.append({"type": "contradiction", "detail": con["description"], "con": con})
+                sq_gaps.append({"type": "contradiction", "detail": con["description"], "con": con,
+                                "note": "sources disagree"})
 
         if not sq_gaps:
             sq.status = "covered"
         elif sq.attempts >= limits.max_attempts_per_sq:
-            other = [g["detail"] for g in sq_gaps if g["type"] != "criteria"]   # unmet criteria go in Limitations
+            # the reason reaches Limitations unverified, so it uses code-written notes, never the reviewer's free text;
+            # unmet criteria are listed there separately
+            other = list(dict.fromkeys(g.get("note", g["detail"]) for g in sq_gaps if g["type"] != "criteria"))
             _close(sq, state, f"still had gaps after {sq.attempts} searches"
                               + (": " + "; ".join(other) if other else ", acceptance criteria not met"))
         else:

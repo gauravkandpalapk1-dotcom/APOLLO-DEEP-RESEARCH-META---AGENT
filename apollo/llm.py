@@ -205,6 +205,14 @@ class LLM:
                 and (c.provider, c.model) not in self._dead_models
                 and self._cooldown.get((c.provider, c.key_index), 0) <= now)
 
+    def _redact(self, text: str) -> str:
+        """Provider error text can echo the key that was sent; name it "provider key #n" instead."""
+        for provider, cfg in self.providers.items():
+            for i, key in enumerate(cfg["keys"]):
+                if key:
+                    text = text.replace(key, f"{provider} key #{i + 1}")
+        return text
+
     def _note(self, text: str):
         with self._lock:
             self._notices.append(text)
@@ -297,7 +305,7 @@ class LLM:
                 resp = self._request(c, system, user, json_mode, temperature)
             except Exception as e:  # classify every provider error; never crash the run
                 kind = classify_error(e)
-                short = f"{c.label}: {kind} ({str(e)[:80]})"
+                short = f"{c.label}: {kind} ({self._redact(str(e))[:80]})"
                 with self._lock:
                     if kind == "json_mode":
                         self._no_json_mode.add((c.provider, c.model))
@@ -318,8 +326,10 @@ class LLM:
                     self.switches += 1
                 self._note(f"{role}: {c.label} failed ({kind}); trying the next model or key")
                 return None
-            text = (resp.choices[0].message.content or "") if resp.choices else ""
-            text = THINK_BLOCK.sub("", text).strip()
+            try:                    # a reply with no message, or a non-JSON body, counts as empty: try the next one
+                text = THINK_BLOCK.sub("", (resp.choices[0].message.content or "") if resp.choices else "").strip()
+            except (AttributeError, IndexError, TypeError):
+                text = ""
             with self._lock:
                 self.budget.add(self._count(role, c, getattr(resp, "usage", None)))
                 if not text:

@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from . import config
 from .config import (ACADEMIC_DOMAINS, ACADEMIC_SECOND_LEVEL, ACADEMIC_SUFFIXES, FILING_PREFIXES, GOVERNMENT_DOMAINS,
                      GOVERNMENT_SUFFIXES, Limits, env)
 from .state import domain_of
@@ -26,6 +27,9 @@ class Doc:
     source_class: str = field(init=False)
 
     def __post_init__(self):
+        # a page cut mid-emoji can leave a lone surrogate, which can't be written as UTF-8 later (JSON, downloads)
+        self.title, self.url, self.text = (str(x).encode("utf-8", "replace").decode("utf-8")
+                                           for x in (self.title, self.url, self.text))
         self.domain = domain_of(self.url)
         self.source_class = classify_source(self.url, self.source_type)
 
@@ -112,7 +116,7 @@ def _tavily_once(key: str, query: str, limits: Limits, topic: str) -> dict:
         "https://api.tavily.com/search",
         headers={"Authorization": f"Bearer {key}"},
         json={"api_key": key, "query": query, "topic": topic, "max_results": limits.results_per_query,
-              "include_raw_content": True, "search_depth": "advanced"},
+              "include_raw_content": True, "search_depth": config.SEARCH_DEPTH},
         timeout=limits.timeout("news" if topic == "news" else "web"),
     )
     r.raise_for_status()

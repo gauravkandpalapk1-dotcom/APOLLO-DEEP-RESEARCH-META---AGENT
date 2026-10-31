@@ -103,6 +103,35 @@ def test_all_fail_raises():
         raise AssertionError("expected AllProvidersFailed")
 
 
+
+def test_keys_in_provider_errors_are_redacted():
+    def b(p, k, m, kw):
+        raise FakeError(401, f"invalid api key {k} for model {m}")      # a provider that echoes the key
+    llm, _ = make(b)
+    try:
+        llm.chat("s", "u")
+    except AllProvidersFailed as e:
+        assert "nv-key-1" not in str(e) and "gm-key-1" not in str(e), str(e)
+        assert "nvidia key #1" in str(e), str(e)
+    else:
+        raise AssertionError("expected AllProvidersFailed")
+
+
+def test_reply_without_a_message_moves_to_the_next_model():
+    class NoMessage:
+        def __init__(self, ok):
+            self.ok = ok
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        def create(self, **kw):
+            if not self.ok:                                     # e.g. a content-filter finish: message=None
+                return SimpleNamespace(choices=[SimpleNamespace(message=None)], usage=None)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="fine"))],
+                                   usage=SimpleNamespace(total_tokens=5))
+    llm = LLM(Budget(10**9), client_factory=lambda p, k: NoMessage(ok=(p == "gemini")))
+    assert llm.chat("s", "u") == "fine" and llm.active["strong"].startswith("gemini:")
+
+
 def test_parallel_calls():
     calls = {"n": 0}
     lock = threading.Lock()
