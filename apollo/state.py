@@ -49,6 +49,10 @@ class SubQ:
     missing: str = ""
     follow_up: str = ""
     status_reason: str = ""
+    perspective: str = ""         # stakeholder view this question is asked from (farmer, regulator, ...)
+    acceptance_criteria: list[dict] = field(default_factory=list)  # 0 to 3 {"id": "c1", "text": ...} checkable statements
+    criteria_met: dict[str, bool] = field(default_factory=dict)    # Hermes' latest verdict per criterion id
+    added_in_round: int = 1
 
 
 @dataclass
@@ -63,6 +67,7 @@ class Plan:
     topic: str
     sections: list[Section]
     subqs: dict[str, SubQ]
+    warnings: list[str] = field(default_factory=list)   # malformed planner output that was skipped
 
 
 @dataclass

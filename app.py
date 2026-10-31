@@ -2,7 +2,7 @@
 import pandas as pd
 import streamlit as st
 
-from apollo.agents import PlanError, plan_from_rows
+from apollo.agents import PlanError, plan_from_rows, plan_rows
 from apollo.config import SOURCE_TYPES, Limits
 from apollo.pipeline import Apollo
 
@@ -29,11 +29,6 @@ with st.sidebar:
 def limits() -> Limits:
     return Limits(max_rounds=max_rounds, max_seconds=minutes * 60, token_budget=int(budget),
                   enabled_sources=tuple(sources or ["web"]))
-
-
-def plan_rows(plan):
-    return [{"section": s.title, "question": plan.subqs[q].question, "query": plan.subqs[q].query,
-             "sources": ", ".join(plan.subqs[q].source_types)} for s in plan.sections for q in s.subq_ids]
 
 
 # ---------------- topic input ----------------
@@ -63,7 +58,8 @@ start = False
 if ss.plan and not ss.report:
     if review_plan:
         st.subheader("Review the plan")
-        st.caption("Edit, add or delete rows. Sources can be any of: " + ", ".join(sources or ["web"]))
+        st.caption("Edit, add or delete rows. c1 and c2 are the acceptance criteria (leave a cell empty for none). "
+                   "Sources can be any of: " + ", ".join(sources or ["web"]))
         edited = st.data_editor(pd.DataFrame(ss.rows), num_rows="dynamic", width="stretch",
                                 key="plan_editor")
         start = st.button("Approve plan and start research", type="primary")
@@ -114,7 +110,7 @@ if rep:
     c[4].metric("Removed in verification", s.get("sentences_removed", 0))
     c[5].metric("Tokens", f"{s.get('tokens_used', 0):,}")
     st.caption(f"Stop condition: {s.get('stop_reason')} · {s.get('failed_searches')} failed searches · "
-               f"{s.get('seconds')}s")
+               f"{s.get('sentences_unverified_removed', 0)} unverifiable sentences removed · {s.get('seconds')}s")
     m = s.get("models")
     if m:
         st.caption("Models used: " + ", ".join(f"{role} = {label}" for role, label in m["active"].items())

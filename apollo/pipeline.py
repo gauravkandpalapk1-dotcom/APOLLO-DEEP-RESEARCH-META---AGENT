@@ -5,7 +5,7 @@
 Every step yields Events so the UI can show progress live."""
 from dataclasses import dataclass
 
-from .agents import apollo_plan, athena, follow_up_jobs, hermes, route
+from .agents import apollo_plan, athena, close_open, follow_up_jobs, hermes, route, status_summary
 from .config import Limits
 from .llm import LLM, AllProvidersFailed, Budget, BudgetExceeded
 from .state import Plan, RunState
@@ -43,6 +43,8 @@ class Apollo:
         yield state.event("plan", f"Plan: {len(plan.sections)} sections, {len(plan.subqs)} sub-questions",
                           {"sections": [{"title": s.title, "questions": [plan.subqs[q].question for q in s.subq_ids]}
                                         for s in plan.sections]})
+        for w in plan.warnings:
+            yield state.event("warning", w)
 
         jobs = [(sq, sq.query) for sq in plan.subqs.values()]
         while True:
@@ -66,17 +68,22 @@ class Apollo:
                 break
             jobs = follow_up_jobs(state, gaps)
             if not jobs:  # nothing left to search for: never loop without work
-                state.stop_reason = "no follow-up queries left"
+                close_open(state, "no follow-up queries left")
+                state.stop_reason = f"no follow-up queries left: {status_summary(plan)}"
                 break
 
         yield state.event("write", f"Writing {len(plan.sections)} sections from their own evidence")
         try:
             results = write_all(state, self.llm)
             for r in results:
+                for p in r.problems:
+                    yield state.event("system", f"Verifier, '{r.section.title}': {p}")
                 yield state.event("verify", f"'{r.section.title}': {r.kept} sentences kept, "
                                             f"{len(r.removed)} removed by verification",
                                   {"removed": r.removed})
-            md, refs, stats, removed = assemble(state, self.llm, results)
+            md, refs, stats, removed, problems = assemble(state, self.llm, results)
+            for p in problems:
+                yield state.event("system", f"Verifier, introduction/conclusion: {p}")
         except BudgetExceeded as e:
             yield state.event("error", f"Stopped while writing: {e}")
             md, refs, stats, removed = (f"# {plan.topic}\n\nThe token budget ran out before the report could be "

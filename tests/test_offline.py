@@ -34,19 +34,34 @@ class FakeLLM:
     def json(self, system, user, **kw):
         self.budget.add(500)
         if system.startswith("You are Apollo"):
-            return {"sections": [
+            return {"perspectives": ["farmer", "regulator", "industry"], "sections": [
                 {"title": "Adoption", "sub_questions": [
-                    {"question": "How many farmers use AI tools?", "query": "farmers AI adoption", "source_types": ["web"]},
-                    {"question": "What slows adoption?", "query": "AI adoption barriers farmers", "source_types": ["web", "arxiv"]}]},
+                    {"question": "How many farmers use AI tools?", "query": "farmers AI adoption", "source_types": ["web"],
+                     "perspective": "farmer"},                     # no criteria: allowed
+                    {"question": "What slows adoption?", "query": "AI adoption barriers farmers", "source_types": ["web", "arxiv"],
+                     "perspective": "industry"}]},
                 {"title": "Policy", "sub_questions": [
-                    {"question": "Which obscure scheme covers drones in district X?", "query": "obscure scheme", "source_types": ["web", "edgar"]}]}]}
+                    {"question": "Which obscure scheme covers drones in district X?", "query": "obscure scheme", "source_types": ["web", "edgar"],
+                     "perspective": "regulator", "acceptance_criteria": [{"id": "c1", "text": "at least one named government scheme"}]},
+                    {"question": "What budget is allocated to farm drones?", "query": "farm drone budget allocation", "source_types": ["web"],
+                     "perspective": "regulator", "acceptance_criteria": [{"id": "c1", "text": "a budget figure dated 2024 or later"}]}]}]}
         if system.startswith("You are Hermes"):
             sqs = re.findall(r'<sub_question id="(q\d+)">', user)
             chunk_sq = re.findall(r'<chunk id="(C\d+)" sq="(q\d+)"', user)
+            chunk_text = re.findall(r'<chunk id="C\d+" sq="(q\d+)" [^>]*>(.*?)</chunk>', user, re.S)
+            criteria = re.findall(r'<criterion sq="(q\d+)" id="(c\d+)">(.*?)</criterion>', user)
             claims = [{"chunk_id": c, "sq_id": q, "entity": "India", "metric": "farmers using AI",
                        "value": "10" if i % 2 == 0 else "50", "unit": "million", "as_of_year": 2025}
                       for i, (c, q) in enumerate(chunk_sq) if q == "q1"]
+
+            def met(q, text):
+                if "budget figure" in text:                    # q4: met only once the evidence holds a budget figure
+                    return any("Budget figure" in t for s, t in chunk_text if s == q)
+                return any(s == q for _, s in chunk_sq)
+
             return {"sub_questions": [{"id": q, "answered": any(s == q for _, s in chunk_sq),
+                                       "criteria_met": {**{cid: met(q, text) for s, cid, text in criteria if s == q},
+                                                        "c9": True},          # an id Hermes invented: ignored
                                        "missing": "", "follow_up_query": f"{q} better query"} for q in sqs],
                     "claims": claims, "source_years": {}, "contradictions": []}
         if system.startswith("You check whether"):
@@ -68,6 +83,9 @@ def fake_search(query, source_type, limits):
         raise SearchError("timeout")                       # failed search
     if "obscure" in query or query.startswith("q3"):
         return []                                          # empty search
+    if query == "q4 better query":                         # only Hermes' follow-up query finds the budget figure
+        return [Doc("Drone budget", "https://budget.example/1", "Budget figure for farm drones: Rs 500 crore. " * 20,
+                    "web", "2026-02-01")]
     if "barriers" in query and "better" not in query:      # q2: thin in round 1, filled in round 2
         return [Doc("Barriers A", "https://a.example/1", "Farmers face cost barriers. " * 20, "web", "2025-01-01")]
     n = len(calls)
@@ -90,6 +108,17 @@ def main():
     assert st.round == 2, f"expected 2 rounds, got {st.round}"
     assert st.plan.subqs["q3"].status == "unfillable"
     assert st.plan.subqs["q1"].status == "covered" and st.plan.subqs["q2"].status == "covered"
+    round2 = next(i for i, e in enumerate(events) if e.kind == "round" and e.text.startswith("Round 2"))
+    r1_gaps = [(e.data.get("sq"), e.data.get("type")) for e in events[:round2] if e.kind == "gap"]
+    assert {t for s, t in r1_gaps if s == "q4"} == {"criteria"}, f"q4 should have only a criteria gap: {r1_gaps}"
+    r2_q4 = {e.data["query"] for e in events[round2:] if e.kind in ("search", "search_fail") and e.data.get("sq") == "q4"}
+    assert r2_q4 == {"q4 better query"}, f"round 2 should use Hermes' follow-up query for q4: {r2_q4}"
+    q4 = st.plan.subqs["q4"]
+    assert q4.status == "covered" and q4.criteria_met == {"c1": True}, (q4.status, q4.criteria_met)
+    assert st.plan.subqs["q1"].acceptance_criteria == [] and st.plan.subqs["q1"].perspective == "farmer"
+    assert st.stop_reason == "complete: 3 covered, 0 partial, 1 unfillable", st.stop_reason
+    assert (report.stats["subqs_covered"], report.stats["subqs_partial"], report.stats["subqs_unfillable"]) == (3, 0, 1)
+    assert report.stats["sentences_unverified_removed"] == 0 and "sentences_unchecked" not in report.stats
     assert st.failed_searches, "edgar failure should be recorded"
     assert any(c["found_by"] == "code" for c in st.contradictions), "10 vs 50 million should be flagged"
     assert "C999" not in report.markdown and not CITE.search(report.markdown), "raw chunk ids leaked"
