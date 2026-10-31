@@ -2,7 +2,9 @@
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from .config import Limits
 
@@ -106,6 +108,10 @@ class Event:
     text: str
     data: dict | None = None
     t: float = 0.0
+    actor: str = "system"   # who did it: one of ACTORS
+
+
+ACTORS = ("apollo", "athena", "hermes", "writer", "oracle", "system")
 
 
 @dataclass
@@ -125,13 +131,17 @@ class RunState:
     search_cap_hit: bool = False
     stop_reason: str = ""
     review_log: list[dict] = field(default_factory=list)
+    run_id: str = field(default_factory=lambda: f"{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:6]}")
+    search_log: list[dict] = field(default_factory=list)   # every search call: round, sq, query, source, urls, status
+    round_log: list[dict] = field(default_factory=list)    # per round: queries per source, new sources/domains,
+                                                           # gaps, Apollo's decision
 
     @property
     def elapsed(self) -> float:
         return time.time() - self.started
 
-    def event(self, kind: str, text: str, data: dict | None = None) -> Event:
-        return Event(kind, text, data, round(self.elapsed, 1))
+    def event(self, kind: str, text: str, data: dict | None = None, actor: str = "system") -> Event:
+        return Event(kind, text, data, round(self.elapsed, 1), actor if actor in ACTORS else "system")
 
     def chunks_for(self, sq_id: str) -> list[Chunk]:
         return [c for c in self.chunks.values() if c.sq_id == sq_id]

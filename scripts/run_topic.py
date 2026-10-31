@@ -1,8 +1,9 @@
 """Run one topic end to end without Streamlit and save everything to runs/<timestamp>-<slug>/.
 Run: python -m scripts.run_topic "<topic>" [--rounds N] [--sources web,news,arxiv]
 
-Files: report.md, events.jsonl, sources.json, stats.json, removed.json (sentences dropped in verification,
-with the reason). A failed run still saves events.jsonl (written line by line as the run goes) plus error.txt."""
+Files: report.md, events.jsonl (each event with its actor), sources.json, stats.json, removed.json (sentences
+dropped in verification, with the reason), provenance.json (everything needed to audit the run).
+A failed run still saves events.jsonl (written line by line as the run goes) plus error.txt."""
 import argparse
 import json
 import re
@@ -13,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from apollo.config import SOURCE_TYPES, Limits
-from apollo.pipeline import Apollo
+from apollo.pipeline import Apollo, provenance
 
 
 def slugify(topic: str) -> str:
@@ -44,10 +45,10 @@ def run(topic: str, limits: Limits, runs_dir: str | Path = "runs", app: Apollo |
     report, error = None, None
 
     with open(out / "events.jsonl", "w", encoding="utf-8") as log:
-        def emit(kind: str, text: str, data: dict | None = None):
+        def emit(kind: str, text: str, data: dict | None = None, actor: str = "system"):
             t = round(time.time() - started, 1)
             print(f"{t:>6}s {kind:<11} {text}", flush=True)
-            log.write(json.dumps({"t": t, "kind": kind, "text": text, "data": data},
+            log.write(json.dumps({"t": t, "actor": actor, "kind": kind, "text": text, "data": data},
                                  default=str, ensure_ascii=False) + "\n")
             log.flush()
 
@@ -55,14 +56,15 @@ def run(topic: str, limits: Limits, runs_dir: str | Path = "runs", app: Apollo |
             app = app or Apollo(limits)
             for w in getattr(app.llm, "warnings", []):
                 emit("warning", w)
-            emit("planning", f"Apollo is planning: {topic} (sources: {', '.join(limits.enabled_sources)})")
+            emit("planning", f"Apollo is planning: {topic} (sources: {', '.join(limits.enabled_sources)})",
+                 actor="apollo")
             plan = app.plan(topic)
             for ev in app.research(plan):
                 if ev.kind == "done":
                     report = ev.data["report"]
-                    emit(ev.kind, ev.text)          # the Report object itself goes to the files below
+                    emit(ev.kind, ev.text, actor=ev.actor)   # the Report object itself goes to the files below
                 else:
-                    emit(ev.kind, ev.text, ev.data)
+                    emit(ev.kind, ev.text, ev.data, ev.actor)
             if report is None:
                 error = "The research loop ended without a report."
         except (Exception, KeyboardInterrupt):  # a failed run still leaves its trace and the reason on disk
@@ -73,6 +75,7 @@ def run(topic: str, limits: Limits, runs_dir: str | Path = "runs", app: Apollo |
         (out / "report.md").write_text(report.markdown, encoding="utf-8")
         _write_json(out / "sources.json", report.sources)
         _write_json(out / "removed.json", report.removed)
+        _write_json(out / "provenance.json", provenance(report))
         _write_json(out / "stats.json", {"topic": topic, "enabled_sources": list(limits.enabled_sources),
                                          "max_rounds": limits.max_rounds, **report.stats})
         if not error and not report.references:

@@ -1,10 +1,12 @@
 """Streamlit UI. Run: streamlit run app.py"""
+import json
+
 import pandas as pd
 import streamlit as st
 
 from apollo.agents import PlanError, plan_from_rows, plan_rows
 from apollo.config import SOURCE_TYPES, Limits
-from apollo.pipeline import Apollo
+from apollo.pipeline import Apollo, provenance
 from apollo.writer import highlight, plain_sentence
 
 st.set_page_config(page_title="Apollo research", page_icon="🔭", layout="wide")
@@ -121,8 +123,11 @@ if rep:
         ["Report", "Evidence", "Sources", "Trace", "Removed sentences"])
     with t_report:
         st.markdown(rep.markdown)
-        d1, d2 = st.columns(2)
+        d1, d2, d3 = st.columns(3)
         d1.download_button("Download Markdown", rep.markdown, file_name="apollo_report.md", mime="text/markdown")
+        d3.download_button("Download provenance JSON",
+                           json.dumps(provenance(rep), indent=2, default=str, ensure_ascii=False),
+                           file_name=f"apollo_provenance_{rep.state.run_id}.json", mime="application/json")
         try:
             from apollo.export import markdown_to_pdf
             d2.download_button("Download PDF", markdown_to_pdf(rep.markdown), file_name="apollo_report.pdf",

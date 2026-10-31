@@ -240,6 +240,31 @@ JSON: {{"introduction": "...", "conclusion": "..."}}""", role="strong")
     return str(res.get("introduction", "")), str(res.get("conclusion", ""))
 
 
+def methodology(state: RunState, models: dict | None, kept: int, removed: int, unverified: int) -> str:
+    """How the report was made, written by code from the run's own logs (no LLM)."""
+    plan = state.plan
+    perspectives = list(dict.fromkeys(sq.perspective for sq in plan.subqs.values() if sq.perspective))
+    lines = [f"- Topic: {plan.topic}.",
+             f"- Perspectives: {', '.join(perspectives) or 'none recorded'}.",
+             f"- Plan: {len(plan.sections)} sections, {len(plan.subqs)} sub-questions."]
+    for r in state.round_log:
+        queries = sum(r["queries"].values())
+        by_type = ", ".join(f"{t} {n}" for t, n in sorted(r["queries"].items())) or "none"
+        gaps = ", ".join(f"{t} {n}" for t, n in sorted(r["gaps"].items())) or "none"
+        decision = "search again" if r["decision"] == "search" else "stop"
+        lines.append(f"- Round {r['round']}: {queries} search call(s) ({by_type}); {r['new_sources']} new source(s), "
+                     f"{r['new_domains']} new domain(s); gaps: {gaps}; Apollo decided to {decision} ({r['reason']}).")
+    lines.append(f"- Stop reason: {state.stop_reason or 'not recorded'}.")
+    if models and models.get("active"):
+        roles = ", ".join(f"{role} = {label}" for role, label in models["active"].items())
+        lines.append(f"- Models: {roles} ({models.get('switches', 0)} model or key switch(es) during the run).")
+    else:
+        lines.append("- Models: not recorded.")
+    lines.append(f"- Verification: {kept} sentence(s) kept, {removed} removed"
+                 + (f" (including {unverified} the verifier could not check)" if unverified else "") + ".")
+    return "\n".join(lines)
+
+
 def limitations(state: RunState, results: list[SectionResult], unverified: int = 0) -> str:
     lines = [f"- Stop condition: {state.stop_reason}."]
     for sq in state.plan.subqs.values():
@@ -293,12 +318,13 @@ def sentence_evidence(records: list[VerifiedSentence], chunks: dict[str, Chunk],
 
     out = []
     for v in records:
-        evidence = [{"ref_number": number.get(c.url), "url": c.url, "title": c.title, "domain": c.domain,
-                     "published": c.published or (str(c.year) if c.year else ""), "passage": c.text}
+        evidence = [{"ref_number": number.get(c.url), "chunk_id": c.id, "url": c.url, "title": c.title,
+                     "domain": c.domain, "published": c.published or (str(c.year) if c.year else ""),
+                     "passage": c.text}
                     for c in (chunks.get(cid) for cid in dict.fromkeys(v.chunk_ids)) if c]
         text = re.sub(r"\s+([.!?])", r"\1", CITE.sub(repl, v.text)).strip()
         out.append({"section": v.section, "text_with_refs": text, "verdict": v.verdict, "reason": v.reason,
-                    "evidence": evidence})
+                    "chunk_ids": list(v.chunk_ids), "evidence": evidence})
     return out
 
 
@@ -340,7 +366,12 @@ def assemble(state: RunState, llm: LLM, results: list[SectionResult]):
         parts += [f"## {r.section.title}", r.text or "*The sources found did not support any statements for this section.*"]
     unverified = sum(why == UNVERIFIED for r in results for _, why in r.removed) + \
         sum(why == UNVERIFIED for _, why in intro_removed)
-    parts += ["## Conclusion", concl or "*No conclusion.*", "## Limitations", limitations(state, results, unverified)]
+    kept = sum(v.verdict == "kept" for r in results for v in r.sentences)               # after duplicates
+    removed = sum(len(r.removed) for r in results) + len(intro_removed)
+    models = llm.status() if hasattr(llm, "status") else None
+    parts += ["## Conclusion", concl or "*No conclusion.*",
+              "## Methodology", methodology(state, models, kept, removed, unverified),
+              "## Limitations", limitations(state, results, unverified)]
     md, refs = render_citations("\n\n".join(parts), state.chunks)
     md += "\n\n## References\n\n" + "\n".join(
         f"{r['n']}. [{r['title']}]({r['url']}) — {r['type']}{', ' + r['published'] if r['published'] else ''}"
@@ -348,8 +379,8 @@ def assemble(state: RunState, llm: LLM, results: list[SectionResult]):
     records = intro_records + [v for r in results for v in r.sentences] + concl_records
     sentences = sentence_evidence(records, state.chunks, refs)
     stats = {
-        "sentences_kept": sum(v.verdict == "kept" for r in results for v in r.sentences),   # after duplicates
-        "sentences_removed": sum(len(r.removed) for r in results) + len(intro_removed),
+        "sentences_kept": kept,
+        "sentences_removed": removed,
         "sentences_unverified_removed": unverified,
         "duplicates_removed": dropped,
         "sources_cited": len(refs),
