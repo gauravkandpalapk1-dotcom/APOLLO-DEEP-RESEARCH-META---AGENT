@@ -1,6 +1,10 @@
 """Streamlit UI. Run: streamlit run app.py"""
+import base64
+import html
 import json
 import time
+from functools import lru_cache
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -18,6 +22,12 @@ ICONS = {"plan": "🗺️", "round": "🔁", "search": "🔎", "search_fail": "�
          "decision": "🧭", "write": "✍️", "verify": "✅", "error": "❌", "done": "📄"}
 ACTORS = {"apollo": ("Apollo", "blue"), "athena": ("Athena", "green"), "hermes": ("Hermes", "orange"),
           "writer": ("Writer", "violet"), "oracle": ("Oracle", "red"), "system": ("System", "gray")}
+ASSETS = Path(__file__).resolve().parent / "assets"
+INTRO_VIDEO = ASSETS / "apollo_intro.mp4"
+# The "Now working" card's portrait per actor; writer, oracle and system events use Apollo's. The emoji stands in
+# when the image file is missing.
+PORTRAITS = {"apollo": ("agent_apollo.jpg", "☀️"), "athena": ("agent_athena.jpg", "🦉"),
+             "hermes": ("agent_hermes.jpg", "🪽")}
 STATUS_FILL = {"open": "#d9d9d9", "covered": "#9bd89b", "partial": "#f6c76b", "unfillable": "#f08c8c"}
 LEGEND = "Sub-questions: :gray[■] open · :green[■] covered · :orange[■] partial · :red[■] unfillable"
 
@@ -30,6 +40,7 @@ for k, v in {"plan": None, "rows": None, "events": [], "report": None, "run": No
 
 # ---------------- settings ----------------
 with st.sidebar:
+    show_intro = st.toggle("Show intro video", value=True)
     st.header("Limits")
     max_rounds = st.slider("Maximum research rounds", 1, 5, 3)
     minutes = st.slider("Time limit for research (minutes)", 2, 30, 10)
@@ -153,8 +164,31 @@ def log_line(e: dict):
     st.markdown(f":{colour}[**{name}**] {ICONS.get(e['kind'], '•')} `{e['t']:>6}s` {text}")
 
 
+@lru_cache(maxsize=None)
+def portrait(actor: str) -> str:
+    """An <img> of the actor's portrait (inlined, so st.markdown can round it), or its emoji if the file is missing."""
+    name, emoji = PORTRAITS.get(actor, PORTRAITS["apollo"])
+    path = ASSETS / name
+    if not path.is_file():
+        return f'<span style="font-size:44px;line-height:64px">{emoji}</span>'
+    data = base64.b64encode(path.read_bytes()).decode()
+    return (f'<img src="data:image/jpeg;base64,{data}" alt="{name}" '
+            f'style="width:64px;height:64px;border-radius:12px;object-fit:cover">')
+
+
+def now_card(slot, e: dict):
+    """The "Now working" card: who is acting and what they are doing, from the latest event."""
+    name = ACTORS.get(e.get("actor"), ACTORS["system"])[0]
+    text = no_latex(html.escape(e["text"]))
+    slot.markdown(f'<div style="display:flex;gap:14px;align-items:center;padding:10px 14px;margin-bottom:8px;'
+                  f'border:1px solid rgba(128,128,128,.35);border-radius:14px">{portrait(e.get("actor"))}'
+                  f'<div><div style="font-size:.8em;opacity:.7">Now working</div><b>{name}</b>'
+                  f'<div>{text}</div></div></div>', unsafe_allow_html=True)
+
+
 def record(ev, metrics):
     ss.events.append({"t": ev.t, "actor": ev.actor, "kind": ev.kind, "text": ev.text, "data": ev.data})
+    now_card(now_slot, ss.events[-1])                   # now_slot: set by the run block, the only caller
     log_line(ss.events[-1])
     m_round, m_sources, m_gaps, m_tokens = metrics
     m_round.metric("Round", ss.run.round)
@@ -207,6 +241,7 @@ def resume_clock(state):
 
 
 # ---------------- topic input ----------------
+intro_slot = st.empty()                 # the intro video; filled further down only while nothing is planned yet
 st.title("Apollo")
 st.caption("Give it a topic. Apollo plans the report, Athena searches, Hermes checks for gaps, "
            "and every sentence in the final report links to the source that supports it.")
@@ -232,6 +267,9 @@ with research_tab:
             st.error(problem(e, "while planning"))
 
     if not ss.plan and ss.run is None and not ss.report:
+        if show_intro and INTRO_VIDEO.is_file():
+            with intro_slot.container(horizontal_alignment="center"):
+                st.video(str(INTRO_VIDEO), autoplay=True, muted=True, loop=True, width=900)
         st.info("Type a topic and press **Plan research**. Apollo drafts sections and sub-questions first; with "
                 "*Let me review the plan before searching* ticked in the sidebar, you can edit them before any "
                 "search runs.")
@@ -294,7 +332,9 @@ with research_tab:
             show_graph(graph_slot, state.plan)
             metrics = (st.empty(), st.empty(), st.empty(), st.empty())
         with live:
+            now_slot = st.empty()
             if ss.events:
+                now_card(now_slot, ss.events[-1])
                 with st.expander(f"Run log so far ({len(ss.events)} events)", expanded=False):
                     for e in ss.events:
                         log_line(e)

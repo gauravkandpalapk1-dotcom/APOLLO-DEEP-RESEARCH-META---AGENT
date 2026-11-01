@@ -1,5 +1,6 @@
 """Headless tests of the Streamlit UI with the fake LLM and fake search: plan graph, actor-labelled log, gap review
-one round per click, the Trace tab, and a rerun in the middle of a run. Run: python -m tests.test_app"""
+one round per click, the Trace tab, a rerun in the middle of a run, the intro video and the "Now working" card.
+Run: python -m tests.test_app"""
 import sys
 from pathlib import Path
 
@@ -265,6 +266,63 @@ def test_button_labels_are_the_standard_ones():
                     "Download Markdown", "Download PDF", "Download provenance JSON"}, seen
 
 
+def _videos(at: AppTest) -> list:
+    return [v.proto for v in at.get("video")]
+
+
+def test_intro_video_on_the_landing_page_only():
+    agents.run_search = fake_search
+    pipeline.LLM = lambda budget: UIFakeLLM()
+    at = AppTest.from_file(APP, default_timeout=60).run()
+    videos = _videos(at)
+    assert len(videos) == 1 and videos[0].autoplay and videos[0].muted and videos[0].loop, videos
+    assert videos[0].url.endswith(".mp4") or "media" in videos[0].url, videos[0].url
+    [t for t in at.sidebar.toggle if t.label == "Show intro video"][0].set_value(False).run()
+    assert not _videos(at), "the sidebar toggle hides it"
+    at = _app(review_gaps=True)                                  # planned: the video is gone in the same rerun
+    assert at.session_state["plan"] is not None and not _videos(at)
+    _click(at, "Approve plan")
+    assert not _videos(at), "hidden while the run is going"
+
+
+def test_missing_assets_folder_does_not_crash():
+    import shutil
+    import tempfile
+    agents.run_search = fake_search
+    pipeline.LLM = lambda budget: UIFakeLLM()
+    with tempfile.TemporaryDirectory() as tmp:                  # app.py alone: no assets/ next to it
+        shutil.copy(APP, Path(tmp) / "app.py")
+        at = AppTest.from_file(str(Path(tmp) / "app.py"), default_timeout=60).run()
+        assert not at.exception and not _videos(at)
+        [t for t in at.toggle if t.label == "Review gaps between rounds"][0].set_value(True)   # pause: card stays
+        at.text_input[0].input(TOPIC).run()
+        _click(at, "Plan research")
+        _click(at, "Approve plan")
+        card = next(m.value for m in at.markdown if "Now working" in m.value)
+        assert "<img" not in card and any(emoji in card for emoji in ("☀️", "🦉", "🪽")), card
+
+
+def test_now_working_card_shows_the_acting_agent():
+    at = _app(review_gaps=True)
+    _click(at, "Approve plan")                                   # paused at the gap review: the card stays
+    events = at.session_state["events"]
+    card = next(m.value for m in at.markdown if "Now working" in m.value)
+    assert f"<b>{ACTOR_NAMES[events[-1]['actor']]}</b>" in card, card
+    for actor, image in (("apollo", "agent_apollo"), ("athena", "agent_athena"), ("hermes", "agent_hermes"),
+                         ("writer", "agent_apollo"), ("oracle", "agent_apollo")):
+        text = f"{actor} is doing <step> 7 for $5"
+        at.session_state["events"] = events + [{"t": 1.0, "actor": actor, "kind": "system", "text": text,
+                                                "data": None}]
+        at.run()
+        card = next(m.value for m in at.markdown if "Now working" in m.value)
+        assert f'alt="{image}.jpg"' in card and f"<b>{ACTOR_NAMES[actor]}</b>" in card, (actor, card[-300:])
+        assert "&lt;step&gt;" in card and "\\$5" in card, "event text escaped: no HTML, no LaTeX"
+
+
+ACTOR_NAMES = {"apollo": "Apollo", "athena": "Athena", "hermes": "Hermes", "writer": "Writer", "oracle": "Oracle",
+               "system": "System"}
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):  # Windows consoles can't print "→" in the default code page
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -275,7 +333,8 @@ def main():
                   test_full_run_with_the_toggle_off,
                   test_gap_review_one_round_per_click, test_rerun_mid_round_does_not_crash,
                   test_empty_states_say_what_to_do, test_errors_explain_the_fix_without_a_stack_trace,
-                  test_button_labels_are_the_standard_ones):
+                  test_button_labels_are_the_standard_ones, test_intro_video_on_the_landing_page_only,
+                  test_missing_assets_folder_does_not_crash, test_now_working_card_shows_the_acting_agent):
             t()
             print("ok  ", t.__name__)
     finally:
