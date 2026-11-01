@@ -35,12 +35,13 @@ ss = st.session_state
 # phase of the current run: None, "round" (searching), "gaps" (waiting for the gap review), "writing", "done".
 # Finding "round" or "writing" at the start of a script run means the last one was interrupted by a rerun.
 for k, v in {"plan": None, "rows": None, "events": [], "report": None, "run": None, "phase": None,
-             "action": None, "gap_rows": [], "gate_log": [], "paused_at": None}.items():
+             "action": None, "gap_rows": [], "gate_log": [], "paused_at": None, "intro_played": False}.items():
     ss.setdefault(k, v)
 
 # ---------------- settings ----------------
 with st.sidebar:
-    show_intro = st.toggle("Show intro video", value=True)
+    show_intro = st.toggle("Show intro video", value=True,
+                           help="Plays full screen once when the page opens. Switch off and on to play it again.")
     st.header("Limits")
     max_rounds = st.slider("Maximum research rounds", 1, 5, 3)
     minutes = st.slider("Time limit for research (minutes)", 2, 30, 10)
@@ -52,6 +53,56 @@ with st.sidebar:
                             help="Pause after each round to choose which gaps to follow up and edit their queries.")
     st.header("Models")
     models_slot = st.empty()
+
+
+@lru_cache(maxsize=1)
+def video_data_uri() -> str:
+    return "data:video/mp4;base64," + base64.b64encode(INTRO_VIDEO.read_bytes()).decode()
+
+
+# Full-window splash: covers the header and sidebar, fades out when the video ends (or on "Skip intro"), leaving the
+# page underneath. The CSS animation hides it anyway after 12 s in case the script or autoplay is blocked.
+SPLASH = """
+<div id="apollo-intro">
+  <video id="apollo-intro-video" src="{src}" autoplay muted playsinline></video>
+  <button id="apollo-intro-skip" type="button">Skip intro ›</button>
+</div>
+<style>
+  #apollo-intro {{position: fixed; inset: 0; z-index: 1000001; background: #000; display: flex;
+                 align-items: center; justify-content: center; transition: opacity .8s ease;
+                 animation: apollo-intro-out .8s ease 12s forwards}}
+  #apollo-intro video {{width: 100vw; height: 100vh; object-fit: cover}}
+  #apollo-intro.gone {{opacity: 0; pointer-events: none}}
+  #apollo-intro-skip {{position: absolute; right: 28px; bottom: 28px; padding: 8px 18px; border-radius: 999px;
+                      border: 1px solid rgba(255,255,255,.6); background: rgba(0,0,0,.45); color: #fff;
+                      font-size: 15px; cursor: pointer}}
+  @keyframes apollo-intro-out {{to {{opacity: 0; visibility: hidden; pointer-events: none}}}}
+</style>
+<script>
+  (() => {{
+    const root = (document.currentScript && document.currentScript.getRootNode()) || document;
+    const intro = root.getElementById("apollo-intro"), video = root.getElementById("apollo-intro-video");
+    if (!intro) return;
+    const close = () => {{ intro.classList.add("gone"); setTimeout(() => intro.remove(), 900); }};
+    video.addEventListener("ended", close);
+    video.addEventListener("error", close);
+    root.getElementById("apollo-intro-skip").addEventListener("click", close);
+    const playing = video.play();
+    if (playing) playing.catch(close);                  // autoplay refused: go straight to the page
+  }})();
+</script>
+"""
+
+
+def play_intro():
+    """The splash, once per browser session (a reload plays it again); skipped silently if the video is missing."""
+    if not show_intro:
+        ss.intro_played = False                         # switching the toggle back on plays it again
+        return
+    if ss.intro_played or not INTRO_VIDEO.is_file():
+        return
+    ss.intro_played = True
+    st.html(SPLASH.format(src=video_data_uri()), unsafe_allow_javascript=True)
 
 
 def limits() -> Limits:
@@ -241,7 +292,7 @@ def resume_clock(state):
 
 
 # ---------------- topic input ----------------
-intro_slot = st.empty()                 # the intro video; filled further down only while nothing is planned yet
+play_intro()
 st.title("Apollo")
 st.caption("Give it a topic. Apollo plans the report, Athena searches, Hermes checks for gaps, "
            "and every sentence in the final report links to the source that supports it.")
@@ -267,9 +318,6 @@ with research_tab:
             st.error(problem(e, "while planning"))
 
     if not ss.plan and ss.run is None and not ss.report:
-        if show_intro and INTRO_VIDEO.is_file():
-            with intro_slot.container(horizontal_alignment="center"):
-                st.video(str(INTRO_VIDEO), autoplay=True, muted=True, loop=True, width=900)
         st.info("Type a topic and press **Plan research**. Apollo drafts sections and sub-questions first; with "
                 "*Let me review the plan before searching* ticked in the sidebar, you can edit them before any "
                 "search runs.")

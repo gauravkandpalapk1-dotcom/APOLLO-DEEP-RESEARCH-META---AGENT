@@ -1,5 +1,6 @@
 """Headless tests of the Streamlit UI with the fake LLM and fake search: plan graph, actor-labelled log, gap review
-one round per click, the Trace tab, a rerun in the middle of a run, the intro video and the "Now working" card.
+one round per click, the Trace tab, a rerun in the middle of a run, the full-window intro video and the "Now working"
+card.
 Run: python -m tests.test_app"""
 import sys
 from pathlib import Path
@@ -266,23 +267,37 @@ def test_button_labels_are_the_standard_ones():
                     "Download Markdown", "Download PDF", "Download provenance JSON"}, seen
 
 
+def _splash(at: AppTest) -> list[str]:
+    """The full-window intro splash(es) on the page."""
+    return [h.proto.body for h in at.get("html") if 'id="apollo-intro"' in h.proto.body]
+
+
 def _videos(at: AppTest) -> list:
-    return [v.proto for v in at.get("video")]
+    return [v.proto for v in at.get("video")] + _splash(at)
 
 
-def test_intro_video_on_the_landing_page_only():
+def test_intro_video_plays_full_window_once_then_the_page():
     agents.run_search = fake_search
     pipeline.LLM = lambda budget: UIFakeLLM()
     at = AppTest.from_file(APP, default_timeout=60).run()
-    videos = _videos(at)
-    assert len(videos) == 1 and videos[0].autoplay and videos[0].muted and videos[0].loop, videos
-    assert videos[0].url.endswith(".mp4") or "media" in videos[0].url, videos[0].url
-    [t for t in at.sidebar.toggle if t.label == "Show intro video"][0].set_value(False).run()
-    assert not _videos(at), "the sidebar toggle hides it"
-    at = _app(review_gaps=True)                                  # planned: the video is gone in the same rerun
+    splash = _splash(at)
+    assert len(splash) == 1 and not at.get("video"), "the splash only, no in-page player"
+    body = splash[0]
+    assert "data:video/mp4;base64," in body and "autoplay muted playsinline" in body and " loop" not in body
+    assert "position: fixed; inset: 0" in body and "100vw" in body and "100vh" in body, "covers the whole window"
+    assert 'addEventListener("ended", close)' in body and "Skip intro" in body, "ends (or is skipped) to the page"
+    assert at.title[0].value == "Apollo", "the page is drawn underneath, ready when the video ends"
+    at.text_input[0].input(TOPIC).run()
+    assert not _splash(at), "once per session: the next rerun doesn't replay it"
+    toggle = [t for t in at.sidebar.toggle if t.label == "Show intro video"][0]
+    toggle.set_value(False).run()
+    assert not _splash(at)
+    [t for t in at.sidebar.toggle if t.label == "Show intro video"][0].set_value(True).run()
+    assert len(_splash(at)) == 1, "switching the toggle off and on plays it again"
+    _click(at, "Plan research")
     assert at.session_state["plan"] is not None and not _videos(at)
     _click(at, "Approve plan")
-    assert not _videos(at), "hidden while the run is going"
+    assert not _videos(at), "never during a run"
 
 
 def test_missing_assets_folder_does_not_crash():
@@ -333,7 +348,7 @@ def main():
                   test_full_run_with_the_toggle_off,
                   test_gap_review_one_round_per_click, test_rerun_mid_round_does_not_crash,
                   test_empty_states_say_what_to_do, test_errors_explain_the_fix_without_a_stack_trace,
-                  test_button_labels_are_the_standard_ones, test_intro_video_on_the_landing_page_only,
+                  test_button_labels_are_the_standard_ones, test_intro_video_plays_full_window_once_then_the_page,
                   test_missing_assets_folder_does_not_crash, test_now_working_card_shows_the_acting_agent):
             t()
             print("ok  ", t.__name__)
